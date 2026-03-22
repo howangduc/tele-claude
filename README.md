@@ -56,10 +56,18 @@ export CLAUDE_TELEGRAM_CHAT_ID="your-chat-id"
 
 ### 4. Run the bot
 
+Run directly with `uvx` (no clone needed):
+
+```bash
+uvx --from git+https://github.com/chiendo97/tele-claude tele-claude
+```
+
+Or clone and run locally:
+
 ```bash
 git clone https://github.com/chiendo97/tele-claude.git
 cd tele-claude
-uv run python main.py
+uv run tele-claude
 ```
 
 ## Usage
