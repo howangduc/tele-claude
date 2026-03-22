@@ -14,3 +14,9 @@ dependencies = [
 
 [project.scripts]
 tele-claude = "tele_claude:main"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.38.3",
+    "ruff>=0.15.7",
+]
