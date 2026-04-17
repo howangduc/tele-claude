@@ -208,7 +208,14 @@ def edit_message(
     text: str,
     parse_mode: str | None = None,
     reply_markup: dict[str, Any] | None = None,
-) -> bool:
+) -> tuple[bool, str]:
+    """Edit a message. Returns (ok, error_description).
+
+    The error string lets callers react to specific failures like
+    "message to edit not found" (the target was deleted by the user
+    or a prior hook), in which case the heartbeat should re-send a
+    fresh placeholder rather than silently drop the update.
+    """
     resp = _call(
         "editMessageText",
         {
@@ -219,7 +226,9 @@ def edit_message(
             "reply_markup": reply_markup,
         },
     )
-    return bool(resp.get("ok"))
+    if resp.get("ok"):
+        return True, ""
+    return False, str(resp.get("description") or "")
 
 
 def delete_message(chat_id: str, message_id: int) -> bool:
@@ -712,6 +721,32 @@ def _clear_heartbeat_if_session(session_id: str) -> None:
     state.clear_heartbeat(session_id)
 
 
+def _edit_or_resend_progress(
+    chat_id: str, session_id: str, msg_id: int, text: str
+) -> None:
+    """Edit the existing ⏳ placeholder OR recover by sending a fresh one.
+
+    If the target message was deleted (by the user, by a previous Stop
+    hook, or whatever), Telegram returns "message to edit not found".
+    That used to be silently swallowed — heartbeat edits became no-ops
+    and the ⏳ never visibly updated. Now we detect that specific error
+    and send a new placeholder, updating the progress file so future
+    edits target the new message. For other errors (rate-limit, parse),
+    we just skip this tick — the next heartbeat will try again.
+    """
+    ok, err = edit_message(chat_id, msg_id, text, parse_mode="HTML")
+    if ok:
+        return
+    # "message to edit not found" → the ⏳ was deleted; resurrect it.
+    # "message is not modified" → same content, expected no-op.
+    if "message to edit not found" in err:
+        new_id = send_message(
+            chat_id, text, parse_mode="HTML", disable_notification=True
+        )
+        if new_id is not None:
+            state.set_progress_msg_id(f"{session_id}:{chat_id}", new_id)
+
+
 def main_reply() -> None:
     data = _stdin_json()
     transcript_raw = data.get("transcript_path")
@@ -1169,7 +1204,7 @@ def main_subagent_stop() -> None:
     for chat_id in chat_ids:
         msg_id = state.get_progress_msg_id(f"{session_id}:{chat_id}")
         if msg_id is not None:
-            edit_message(chat_id, msg_id, text, parse_mode="HTML")
+            _edit_or_resend_progress(chat_id, session_id, msg_id, text)
 
 
 def main_teammate_idle() -> None:
