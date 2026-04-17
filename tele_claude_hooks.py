@@ -120,11 +120,14 @@ def _call(method: str, data: dict[str, Any]) -> dict[str, Any]:
         # the log says "Bad Request: can't parse entities" instead of
         # a generic catch-all. Falls back to str(exc) for network errors.
         err_detail = str(exc)
-        body_read = getattr(exc, "read", None)
-        if callable(body_read):
+        # HTTPError objects carry `.read()` with the Telegram-returned
+        # error body. Narrow via HTTPError explicitly so we don't need
+        # a blanket getattr/cast dance.
+        from urllib.error import HTTPError
+
+        if isinstance(exc, HTTPError):
             try:
-                raw: bytes = body_read()
-                err_detail = raw.decode("utf-8", errors="replace")[:400]
+                err_detail = exc.read().decode("utf-8", errors="replace")[:400]
             except Exception:
                 pass
         # "message is not modified" is expected for heartbeat edits when
