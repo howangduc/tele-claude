@@ -849,18 +849,31 @@ def main_progress() -> None:
             _spawn_typing_pumper(session_id, chat_id)
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Shorten text with an ellipsis if it exceeds ``limit`` chars."""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _summarise_in_progress(
     transcript_path: Path,
-) -> tuple[int, str, str | None]:
-    """Return (tool_count, last_tool_name, latest_text) for the current turn.
+) -> tuple[int, str, str | None, list[str]]:
+    """Return (tool_count, last_tool_name, latest_text, running_subagents).
 
     Counts assistant tool_use blocks since the last real user prompt and
-    captures the most recent text block so the heartbeat update can
-    preview what Claude has been saying along the way.
+    captures the most recent text block so the heartbeat can preview
+    what Claude has been saying along the way.
+
+    ``running_subagents`` lists the ``description`` of any ``Task`` tool
+    call whose matching ``tool_result`` hasn't arrived yet — i.e. the
+    subagents currently doing work. Without this, Task fan-outs look
+    like dead air on the heartbeat (the main transcript is quiet while
+    subagents write to their own JSONL under ``subagents/``).
     """
     tool_count = 0
     last_tool = ""
     latest_text: str | None = None
+    task_descriptions: dict[str, str] = {}
+    completed_ids: set[str] = set()
     try:
         with transcript_path.open() as f:
             for line in f:
@@ -879,6 +892,19 @@ def _summarise_in_progress(
                         tool_count = 0
                         last_tool = ""
                         latest_text = None
+                        task_descriptions = {}
+                        completed_ids = set()
+                        continue
+                    # tool_result entry — record completed tool_use IDs
+                    # so matching Task calls drop off "still running".
+                    for block in blocks:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                        ):
+                            tuid = str(block.get("tool_use_id") or "")
+                            if tuid:
+                                completed_ids.add(tuid)
                     continue
                 if role != "assistant":
                     continue
@@ -888,14 +914,32 @@ def _summarise_in_progress(
                     btype = block.get("type")
                     if btype == "tool_use":
                         tool_count += 1
-                        last_tool = str(block.get("name") or "")
+                        name = str(block.get("name") or "")
+                        last_tool = name
+                        if name == "Task":
+                            tuid = str(block.get("id") or "")
+                            inp = block.get("input") or {}
+                            desc = ""
+                            if isinstance(inp, dict):
+                                desc = str(
+                                    inp.get("description")
+                                    or inp.get("subagent_type")
+                                    or ""
+                                ).strip()
+                            if tuid:
+                                task_descriptions[tuid] = desc
                     elif btype == "text":
                         text = block.get("text") or ""
                         if text:
                             latest_text = text
     except OSError:
         pass
-    return tool_count, last_tool, latest_text
+    running_subagents = [
+        desc
+        for tuid, desc in task_descriptions.items()
+        if tuid not in completed_ids and desc
+    ]
+    return tool_count, last_tool, latest_text, running_subagents
 
 
 def main_post_tool_use() -> None:
