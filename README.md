@@ -229,6 +229,8 @@ The base bot is one-way: Telegram → tmux. Three Claude Code hooks close the lo
 |------|------------|--------------|
 | `UserPromptSubmit` | You (or the bot) submit a prompt to Claude | Sends an ⏳ placeholder to Telegram with a preview |
 | `PostToolUse` | After every tool call Claude runs | Throttled heartbeat that edits ⏳ with `Working… N tool calls, last: <Tool>` + a preview of the most recent text block. Prevents long agent turns from going radio-silent. |
+| `SubagentStop` | A Task-spawned subagent finishes | Immediately refreshes the heartbeat, adds `✓ subagent done: <agent_type>` line, and lets the running-subagents list shrink without waiting for the PostToolUse throttle. |
+| `TeammateIdle` | An Agent Team teammate is about to go idle (experimental — requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`) | Sends a fresh 🧑‍💻 push notification with the teammate name + role + last message preview, so you know to send them more work. |
 | `Stop` | Claude finishes a turn | Edits that placeholder into the full response (or sends new if no placeholder) |
 | `Notification` | Claude needs attention (permission, idle) | Sends 🔐 / 💤 to Telegram — permission prompts include Allow/Always/Deny buttons |
 
@@ -328,10 +330,32 @@ HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
 exec python3 "$HOME_DIR/tele_claude_hooks.py" post_tool_use
 ```
 
+Save as `~/.claude/hooks/telegram-subagent-stop.sh`:
+
+```bash
+#!/usr/bin/env bash
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" subagent_stop
+```
+
+Save as `~/.claude/hooks/telegram-teammate-idle.sh` *(only useful if you set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and use Claude Code's Agent Teams feature)*:
+
+```bash
+#!/usr/bin/env bash
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" teammate_idle
+```
+
 Make them executable:
 
 ```bash
-chmod +x ~/.claude/hooks/telegram-{notify,reply,progress,post-tool-use}.sh
+chmod +x ~/.claude/hooks/telegram-{notify,reply,progress,post-tool-use,subagent-stop,teammate-idle}.sh
 ```
 
 > **Where the repo lives.** All three wrappers look for the Python module at `~/tele-claude/tele_claude_hooks.py`. Cloned elsewhere? Add `export TELE_CLAUDE_HOME=/path/to/repo` to `~/.config/tele-claude/env`.
@@ -372,6 +396,22 @@ Add to `~/.claude/settings.json`:
         "matcher": "",
         "hooks": [
           { "type": "command", "command": "~/.claude/hooks/telegram-post-tool-use.sh" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/telegram-subagent-stop.sh" }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/telegram-teammate-idle.sh" }
         ]
       }
     ]
