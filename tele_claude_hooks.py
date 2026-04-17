@@ -483,8 +483,11 @@ def _describe_tool_use(tool: dict[str, Any]) -> str | None:
     if name == "Write":
         path = inp.get("file_path") or "?"
         content = str(inp.get("content") or "")
-        lines = content.count("\n") + (1 if content else 0)
-        return f"📝 <b>Write</b> <code>{esc(path)}</code> ({lines} lines)"
+        # Rename from `lines` to avoid shadowing the `list[str]` named
+        # `lines` in the AskUserQuestion branch above (basedpyright trips
+        # on the name reuse even though control flow makes it safe).
+        line_count = content.count("\n") + (1 if content else 0)
+        return f"📝 <b>Write</b> <code>{esc(path)}</code> ({line_count} lines)"
     if name == "Edit":
         path = inp.get("file_path") or "?"
         old = str(inp.get("old_string") or "").splitlines()

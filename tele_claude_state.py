@@ -57,6 +57,22 @@ def _save(state: dict[str, object]) -> None:
         raise
 
 
+def _load_str_list(state: dict[str, object], key: str) -> list[str]:
+    """Narrow a state value to ``list[str]``.
+
+    ``_load()`` returns ``dict[str, object]`` for type safety, which means
+    every accessor has to narrow the ``object`` back down before using it.
+    This helper centralises that pattern so the rest of the file doesn't
+    repeat ``isinstance(x, list)`` checks inline (and keeps basedpyright
+    happy — ``set(state.get(...) or [])`` trips on the ``object`` type).
+    Non-str entries in the list are dropped defensively.
+    """
+    value = state.get(key)
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
 # ---------- Active pane (per Telegram chat) ----------
 
 
@@ -79,14 +95,13 @@ def set_active_pane(chat_id: int, pane_id: str) -> None:
 
 
 def get_subscribed_panes() -> set[str]:
-    data = _load().get("subscribed_panes", [])
-    return set(data) if isinstance(data, list) else set()
+    return set(_load_str_list(_load(), "subscribed_panes"))
 
 
 def subscribe_pane(pane_id: str) -> None:
     """Add a pane to the subscription set so hooks forward from it."""
     state = _load()
-    subs = set(state.get("subscribed_panes", []) or [])
+    subs = set(_load_str_list(state, "subscribed_panes"))
     if pane_id in subs:
         return
     subs.add(pane_id)
@@ -96,7 +111,7 @@ def subscribe_pane(pane_id: str) -> None:
 
 def unsubscribe_pane(pane_id: str) -> None:
     state = _load()
-    subs = set(state.get("subscribed_panes", []) or [])
+    subs = set(_load_str_list(state, "subscribed_panes"))
     if pane_id not in subs:
         return
     subs.discard(pane_id)
@@ -117,13 +132,13 @@ def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
     state = _load()
     changed = False
 
-    subs = set(state.get("subscribed_panes", []) or [])
+    subs = set(_load_str_list(state, "subscribed_panes"))
     dead_subs = subs - alive_pane_ids
     if dead_subs:
         state["subscribed_panes"] = sorted(subs - dead_subs)
         changed = True
 
-    muted = set(state.get("muted_panes", []) or [])
+    muted = set(_load_str_list(state, "muted_panes"))
     dead_muted = muted - alive_pane_ids
     if dead_muted:
         state["muted_panes"] = sorted(muted - dead_muted)
@@ -147,13 +162,12 @@ def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
 
 
 def get_muted_panes() -> set[str]:
-    muted = _load().get("muted_panes", [])
-    return set(muted) if isinstance(muted, list) else set()
+    return set(_load_str_list(_load(), "muted_panes"))
 
 
 def mute_pane(pane_id: str) -> None:
     state = _load()
-    muted = set(state.get("muted_panes", []) or [])
+    muted = set(_load_str_list(state, "muted_panes"))
     muted.add(pane_id)
     state["muted_panes"] = sorted(muted)
     _save(state)
@@ -161,7 +175,7 @@ def mute_pane(pane_id: str) -> None:
 
 def unmute_pane(pane_id: str) -> None:
     state = _load()
-    muted = set(state.get("muted_panes", []) or [])
+    muted = set(_load_str_list(state, "muted_panes"))
     muted.discard(pane_id)
     state["muted_panes"] = sorted(muted)
     _save(state)
