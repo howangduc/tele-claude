@@ -541,33 +541,32 @@ def main_notify() -> None:
         header_parts.append(f"<code>{html.escape(pane_id)}</code>")
     header = "  ·  ".join(header_parts)
 
-    # Body: the generic "Claude needs your permission to use X" message
-    # plus a rich description of the pending tool_use (for permission
-    # prompts — idle_prompt rarely has a transcript-worthy target).
+    # For permission / elicitation notifications we augment the body with
+    # the actual pending tool_use (bash command, plan content, question,
+    # etc.) and tailor the reply keyboard — AskUserQuestion gets one
+    # button per option, ExitPlanMode gets Approve / Keep planning,
+    # everything else keeps the default Allow / Always / Deny row.
+    pending_tool: dict[str, Any] | None = None
+    if notif_type in ("permission_prompt", "elicitation_dialog") and transcript_raw:
+        path = Path(str(transcript_raw))
+        if path.exists():
+            pending_tool = _find_last_tool_use(path)
+
     body_parts: list[str] = []
     if msg_text:
         body_parts.append(html.escape(msg_text))
-    if notif_type == "permission_prompt" and transcript_raw:
-        path = Path(str(transcript_raw))
-        if path.exists():
-            detail = _describe_pending_tool_use(path)
-            if detail:
-                body_parts.append(detail)
+    if pending_tool:
+        detail = _describe_tool_use(pending_tool)
+        if detail:
+            body_parts.append(detail)
+
     text = header
     if body_parts:
         text = header + "\n\n" + "\n\n".join(body_parts)
 
     reply_markup: dict[str, Any] | None = None
-    if notif_type == "permission_prompt" and pane_id:
-        reply_markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "1 · Allow once", "callback_data": f"ans:{pane_id}:1"},
-                    {"text": "2 · Always", "callback_data": f"ans:{pane_id}:2"},
-                    {"text": "3 · Deny", "callback_data": f"ans:{pane_id}:3"},
-                ]
-            ]
-        }
+    if notif_type == "permission_prompt":
+        reply_markup = _build_permission_keyboard(pane_id, pending_tool)
 
     for chat_id in _chat_ids():
         send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
