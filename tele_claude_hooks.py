@@ -306,14 +306,8 @@ def _wait_for_stable_text(
     return prev
 
 
-def _describe_pending_tool_use(transcript_path: Path) -> str | None:
-    """Return an HTML snippet describing the most recent tool_use block.
-
-    Used by the Notification hook so permission prompts tell you WHICH
-    command/file/pattern Claude wants approval for, not just "needs
-    permission to use Bash". Each known tool gets a tuned renderer; the
-    fallback dumps the first few input keys so at least the shape shows.
-    """
+def _find_last_tool_use(transcript_path: Path) -> dict[str, Any] | None:
+    """Return the most recent assistant tool_use block, or None."""
     last: dict[str, Any] | None = None
     try:
         with transcript_path.open() as f:
@@ -330,11 +324,19 @@ def _describe_pending_tool_use(transcript_path: Path) -> str | None:
                         last = block
     except OSError:
         return None
-    if not last:
-        return None
+    return last
 
-    name = str(last.get("name") or "?")
-    inp = last.get("input") or {}
+
+def _describe_tool_use(tool: dict[str, Any]) -> str | None:
+    """Render a tool_use block as a Telegram HTML snippet.
+
+    Used by the Notification hook to tell you exactly what Claude wants
+    approval for. Known tools get bespoke renderers (Bash → command,
+    Edit → file + diff size, ExitPlanMode → plan body, AskUserQuestion
+    → question text); unknowns fall back to a shape hint.
+    """
+    name = str(tool.get("name") or "?")
+    inp = tool.get("input") or {}
     if not isinstance(inp, dict):
         return f"<b>{html.escape(name)}</b>"
 
@@ -353,6 +355,24 @@ def _describe_pending_tool_use(transcript_path: Path) -> str | None:
                 body += f"\n<i>{esc(desc, 200)}</i>"
             return body
         return "<b>Bash</b>"
+    if name == "ExitPlanMode":
+        plan = str(inp.get("plan") or "").strip()
+        if plan:
+            if len(plan) > 2500:
+                plan = plan[:2500].rstrip() + "\n\n…(plan truncated, see pane)"
+            rendered = tele_claude_format.convert(plan)
+            return f"📋 <b>Plan to execute</b>\n\n{rendered}"
+        return "📋 <b>Plan approval requested</b>"
+    if name == "AskUserQuestion":
+        questions = inp.get("questions") or []
+        if isinstance(questions, list) and questions:
+            first = questions[0] if isinstance(questions[0], dict) else {}
+            q_text = str(first.get("question") or "").strip()
+            multi = first.get("multiSelect")
+            suffix = " <i>(select all that apply)</i>" if multi else ""
+            if q_text:
+                return f"❓ <b>{esc(q_text)}</b>{suffix}"
+        return "❓ <b>Question needs an answer</b>"
     if name == "Write":
         path = inp.get("file_path") or "?"
         content = str(inp.get("content") or "")
@@ -389,6 +409,73 @@ def _describe_pending_tool_use(transcript_path: Path) -> str | None:
     # Unknown tool — show name + first few input keys as shape hint.
     keys = ", ".join(list(inp.keys())[:3])
     return f"🛠 <b>{esc(name)}</b>({esc(keys, 120)})"
+
+
+def _build_permission_keyboard(
+    pane_id: str, tool: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Pick the right inline keyboard for a pending permission.
+
+    AskUserQuestion gets one button per declared option (1..N) so
+    tapping sends the matching digit that Claude's TUI expects.
+    ExitPlanMode uses 2 buttons (Approve / Keep planning). Everything
+    else falls back to Allow once / Always / Deny.
+    """
+    if not pane_id:
+        return None
+
+    if tool and tool.get("name") == "AskUserQuestion":
+        inp = tool.get("input") or {}
+        questions = inp.get("questions") if isinstance(inp, dict) else None
+        if isinstance(questions, list) and questions and isinstance(questions[0], dict):
+            options = questions[0].get("options")
+            if isinstance(options, list) and options:
+                rows: list[list[dict[str, Any]]] = []
+                for idx, opt in enumerate(options[:8], start=1):
+                    label = ""
+                    if isinstance(opt, dict):
+                        label = str(opt.get("label") or "")
+                    elif isinstance(opt, str):
+                        label = opt
+                    if not label:
+                        label = f"Option {idx}"
+                    if len(label) > 40:
+                        label = label[:37] + "…"
+                    rows.append(
+                        [
+                            {
+                                "text": f"{idx}. {label}",
+                                "callback_data": f"ans:{pane_id}:{idx}",
+                            }
+                        ]
+                    )
+                return {"inline_keyboard": rows}
+
+    if tool and tool.get("name") == "ExitPlanMode":
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ Approve plan",
+                        "callback_data": f"ans:{pane_id}:1",
+                    },
+                    {
+                        "text": "📝 Keep planning",
+                        "callback_data": f"ans:{pane_id}:2",
+                    },
+                ]
+            ]
+        }
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "1 · Allow once", "callback_data": f"ans:{pane_id}:1"},
+                {"text": "2 · Always", "callback_data": f"ans:{pane_id}:2"},
+                {"text": "3 · Deny", "callback_data": f"ans:{pane_id}:3"},
+            ]
+        ]
+    }
 
 
 def _last_assistant_text(transcript_path: Path) -> str:
