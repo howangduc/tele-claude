@@ -228,6 +228,7 @@ The base bot is one-way: Telegram → tmux. Three Claude Code hooks close the lo
 | Hook | Fires when | What it does |
 |------|------------|--------------|
 | `UserPromptSubmit` | You (or the bot) submit a prompt to Claude | Sends an ⏳ placeholder to Telegram with a preview |
+| `PostToolUse` | After every tool call Claude runs | Throttled heartbeat that edits ⏳ with `Working… N tool calls, last: <Tool>` + a preview of the most recent text block. Prevents long agent turns from going radio-silent. |
 | `Stop` | Claude finishes a turn | Edits that placeholder into the full response (or sends new if no placeholder) |
 | `Notification` | Claude needs attention (permission, idle) | Sends 🔐 / 💤 to Telegram — permission prompts include Allow/Always/Deny buttons |
 
@@ -316,10 +317,21 @@ HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
 exec python3 "$HOME_DIR/tele_claude_hooks.py" progress
 ```
 
+Save as `~/.claude/hooks/telegram-post-tool-use.sh`:
+
+```bash
+#!/usr/bin/env bash
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" post_tool_use
+```
+
 Make them executable:
 
 ```bash
-chmod +x ~/.claude/hooks/telegram-{notify,reply,progress}.sh
+chmod +x ~/.claude/hooks/telegram-{notify,reply,progress,post-tool-use}.sh
 ```
 
 > **Where the repo lives.** All three wrappers look for the Python module at `~/tele-claude/tele_claude_hooks.py`. Cloned elsewhere? Add `export TELE_CLAUDE_HOME=/path/to/repo` to `~/.config/tele-claude/env`.
@@ -352,6 +364,14 @@ Add to `~/.claude/settings.json`:
         "matcher": "",
         "hooks": [
           { "type": "command", "command": "~/.claude/hooks/telegram-progress.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/telegram-post-tool-use.sh" }
         ]
       }
     ]
