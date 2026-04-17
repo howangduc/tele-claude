@@ -75,6 +75,7 @@ _BUILTIN_COMMANDS = {
     "panes",
     "use",
     "which",
+    "pwd",
     "cancel",
     "mute",
     "unmute",
@@ -234,6 +235,32 @@ async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     current = state.get_active_pane(message.chat_id)
     _ = await message.reply_text(
         f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
+    )
+
+
+async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the live `pane_current_path` of a pane as a tap-to-copy code block."""
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    if not pane_id:
+        _ = await message.reply_text(
+            "Usage: /pwd [%N] (or set an active pane via /use %N)"
+        )
+        return
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(f"Pane {pane_id} no longer exists.")
+        return
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_current_path}"],
+        capture_output=True,
+        text=True,
+    )
+    path = result.stdout.strip() or "(empty)"
+    _ = await message.reply_text(
+        f"<b>{_html.escape(pane_id)}</b>\n<code>{_html.escape(path)}</code>",
+        parse_mode="HTML",
     )
 
 
@@ -686,6 +713,7 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("panes", "List Claude Code panes (tap to activate+subscribe)", cmd_panes),
     ("use", "Set active pane: /use %N", cmd_use),
     ("which", "Show the active pane", cmd_which),
+    ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
     ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
     ("mute", "Silence hooks: /mute %N", cmd_mute),
     ("unmute", "Re-enable hooks: /unmute %N", cmd_unmute),

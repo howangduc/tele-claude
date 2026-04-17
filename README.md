@@ -138,6 +138,7 @@ If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its ab
 | `/panes` | Lists Claude Code panes as tappable buttons. Tapping a button sets the **active pane**. Muted panes show a 🔕 badge; the active pane shows ●. |
 | `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
 | `/which` | Shows the current active pane. |
+| `/pwd [%N]` | Shows the pane's live working directory (`pane_current_path`) as a tap-to-copy code block. Falls back to active pane if omitted. |
 | `/cancel [%N]` | Sends **Ctrl-C** to a pane (active pane if `%N` omitted). Stops a runaway turn from your phone. |
 | `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane (still subscribed). |
 | `/unmute %N` | Resumes forwarding. |
