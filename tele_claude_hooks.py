@@ -422,6 +422,7 @@ def main_reply() -> None:
 def main_notify() -> None:
     data = _stdin_json()
     notif_type = str(data.get("notification_type") or "unknown")
+    msg_text = str(data.get("message") or "").strip()
     session_id = str(data.get("session_id") or "unknown")
     cwd = str(data.get("cwd") or "")
     pane_id = os.environ.get("TMUX_PANE", "")
@@ -445,13 +446,20 @@ def main_notify() -> None:
     }
     emoji, label = labels.get(notif_type, ("🔔", "Notification"))
 
-    parts = [f"{emoji} <b>{html.escape(label)}</b>"]
+    # Header: emoji + label + project + pane on one line.
+    header_parts = [f"{emoji} <b>{html.escape(label)}</b>"]
     project = _project(cwd)
     if project:
-        parts.append(f"<code>{html.escape(project)}</code>")
+        header_parts.append(f"<code>{html.escape(project)}</code>")
     if pane_id:
-        parts.append(f"<code>{html.escape(pane_id)}</code>")
-    text = "  ·  ".join(parts)
+        header_parts.append(f"<code>{html.escape(pane_id)}</code>")
+    header = "  ·  ".join(header_parts)
+
+    # Body: the actual notification message (e.g., "Claude needs your
+    # permission to use Bash") on a second line, if provided.
+    text = header
+    if msg_text:
+        text = f"{header}\n{html.escape(msg_text)}"
 
     reply_markup: dict[str, Any] | None = None
     if notif_type == "permission_prompt" and pane_id:
