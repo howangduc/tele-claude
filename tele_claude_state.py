@@ -237,6 +237,46 @@ def remove_claude_shortcut(name: str) -> None:
     _save(state)
 
 
+# ---------- Progress heartbeat throttle (PostToolUse hook) ----------
+
+
+def _heartbeat_file(session_id: str) -> Path:
+    path = _cache_root() / "heartbeat"
+    path.mkdir(parents=True, exist_ok=True)
+    safe = session_id.replace("/", "_")
+    return path / f"{safe}.ts"
+
+
+def should_heartbeat(session_id: str, min_interval_seconds: float = 5.0) -> bool:
+    """Return True if enough time has passed since the last heartbeat.
+
+    Used by PostToolUse to throttle ⏳ updates — Telegram limits edits
+    to ~30/min/chat, and updating after every single tool call would
+    spam both the wire and the user's notification tray.
+    """
+    path = _heartbeat_file(session_id)
+    now = time.time()
+    if path.exists():
+        try:
+            last = float(path.read_text().strip())
+            if now - last < min_interval_seconds:
+                return False
+        except (OSError, ValueError):
+            pass
+    try:
+        path.write_text(f"{now:.3f}")
+    except OSError:
+        pass
+    return True
+
+
+def clear_heartbeat(session_id: str) -> None:
+    try:
+        _heartbeat_file(session_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
 # ---------- Activity tracking (for idle-notification suppression) ----------
 
 

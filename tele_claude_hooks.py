@@ -609,6 +609,11 @@ def _last_assistant_text(transcript_path: Path) -> str:
 # ---------- Mode: reply ----------
 
 
+def _clear_heartbeat_if_session(session_id: str) -> None:
+    """Drop the throttle marker so the next turn's heartbeat fires immediately."""
+    state.clear_heartbeat(session_id)
+
+
 def main_reply() -> None:
     data = _stdin_json()
     transcript_raw = data.get("transcript_path")
@@ -674,6 +679,8 @@ def main_reply() -> None:
                 send_message(chat_id, body, parse_mode="HTML", reply_markup=markup)
 
         state.clear_progress(progress_key)
+    # Turn done — reset the heartbeat throttle for the next turn.
+    _clear_heartbeat_if_session(session_id)
 
 
 # ---------- Mode: notify ----------
@@ -806,6 +813,116 @@ def main_progress() -> None:
             _spawn_typing_pumper(session_id, chat_id)
 
 
+def _summarise_in_progress(
+    transcript_path: Path,
+) -> tuple[int, str, str | None]:
+    """Return (tool_count, last_tool_name, latest_text) for the current turn.
+
+    Counts assistant tool_use blocks since the last real user prompt and
+    captures the most recent text block so the heartbeat update can
+    preview what Claude has been saying along the way.
+    """
+    tool_count = 0
+    last_tool = ""
+    latest_text: str | None = None
+    try:
+        with transcript_path.open() as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = entry.get("message") or {}
+                role = msg.get("role")
+                blocks = msg.get("content") or []
+                if role == "user":
+                    is_real_prompt = any(
+                        isinstance(b, dict) and b.get("type") == "text" for b in blocks
+                    ) or isinstance(msg.get("content"), str)
+                    if is_real_prompt:
+                        tool_count = 0
+                        last_tool = ""
+                        latest_text = None
+                    continue
+                if role != "assistant":
+                    continue
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_use":
+                        tool_count += 1
+                        last_tool = str(block.get("name") or "")
+                    elif btype == "text":
+                        text = block.get("text") or ""
+                        if text:
+                            latest_text = text
+    except OSError:
+        pass
+    return tool_count, last_tool, latest_text
+
+
+def main_post_tool_use() -> None:
+    """Update the ⏳ placeholder with a live progress snapshot.
+
+    Fires after every tool call Claude runs, but throttled to one
+    update every ~5 s per session (Telegram rate-limits edits and
+    the user doesn't need every single edit reflected). Skipped
+    when the pane isn't subscribed, is muted, or no ⏳ progress
+    placeholder is tracked for this session.
+    """
+    data = _stdin_json()
+    session_id = str(data.get("session_id") or "unknown")
+    transcript_raw = data.get("transcript_path")
+    cwd = str(data.get("cwd") or "")
+    pane_id = os.environ.get("TMUX_PANE", "")
+
+    state.touch_activity(session_id)
+
+    if pane_id and not state.is_subscribed(pane_id):
+        return
+    if pane_id and state.is_muted(pane_id):
+        return
+    if not transcript_raw:
+        return
+    transcript_path = Path(str(transcript_raw))
+    if not transcript_path.exists():
+        return
+
+    # Don't heartbeat unless there's actually a ⏳ placeholder to edit.
+    chat_ids = _chat_ids()
+    any_pending = any(
+        state.get_progress_msg_id(f"{session_id}:{c}") is not None for c in chat_ids
+    )
+    if not any_pending:
+        return
+
+    if not state.should_heartbeat(session_id):
+        return  # throttled — another update came <5 s ago
+
+    tool_count, last_tool, latest_text = _summarise_in_progress(transcript_path)
+    header = _build_header(cwd, pane_id, "⏳")
+
+    # Body: tool counter + optional preview of the most recent text block.
+    lines = [
+        f"<i>Working… {tool_count} tool call{'' if tool_count == 1 else 's'}"
+        + (f", last: <code>{html.escape(last_tool)}</code>" if last_tool else "")
+        + "</i>"
+    ]
+    if latest_text:
+        preview = latest_text.strip()
+        if len(preview) > 600:
+            preview = preview[:600].rstrip() + "…"
+        lines.append(f"<blockquote expandable>{html.escape(preview)}</blockquote>")
+    text = f"{header}\n\n" + "\n\n".join(lines)
+
+    for chat_id in chat_ids:
+        msg_id = state.get_progress_msg_id(f"{session_id}:{chat_id}")
+        if msg_id is None:
+            continue
+        edit_message(chat_id, msg_id, text, parse_mode="HTML")
+
+
 def main_pump() -> None:
     """Entry point for the typing-indicator pumper subprocess.
 
@@ -841,9 +958,16 @@ def main() -> None:
         return
 
     parser = argparse.ArgumentParser()
-    _ = parser.add_argument("mode", choices=["notify", "reply", "progress"])
+    _ = parser.add_argument(
+        "mode", choices=["notify", "reply", "progress", "post_tool_use"]
+    )
     args = parser.parse_args()
-    handlers = {"notify": main_notify, "reply": main_reply, "progress": main_progress}
+    handlers = {
+        "notify": main_notify,
+        "reply": main_reply,
+        "progress": main_progress,
+        "post_tool_use": main_post_tool_use,
+    }
     try:
         handlers[args.mode]()
     except SystemExit:
