@@ -306,9 +306,25 @@ def _wait_for_stable_text(
     return prev
 
 
-def _find_last_tool_use(transcript_path: Path) -> dict[str, Any] | None:
-    """Return the most recent assistant tool_use block, or None."""
-    last: dict[str, Any] | None = None
+def _find_pending_context(
+    transcript_path: Path,
+) -> tuple[dict[str, Any] | None, str]:
+    """Return (most-recent tool_use, text written just before it).
+
+    The "preamble" is the assistant's free-form narration between the
+    previous boundary (tool_use or real user prompt) and the current
+    tool_use — exactly what the user would see on-pane just above the
+    permission dialog. Knowing that context is crucial when approving
+    `AskUserQuestion` or `ExitPlanMode` from the phone.
+
+    Tool_result entries (user role, content type=tool_result) don't
+    reset the accumulator because they're part of the same assistant
+    turn. Only a real user prompt (role=user with a text block or
+    string content) clears everything.
+    """
+    current_texts: list[str] = []
+    last_tool: dict[str, Any] | None = None
+    last_context: str = ""
     try:
         with transcript_path.open() as f:
             for line in f:
@@ -317,14 +333,40 @@ def _find_last_tool_use(transcript_path: Path) -> dict[str, Any] | None:
                 except json.JSONDecodeError:
                     continue
                 msg = entry.get("message") or {}
-                if msg.get("role") != "assistant":
+                role = msg.get("role")
+                blocks = msg.get("content") or []
+                if role == "user":
+                    is_real_prompt = any(
+                        isinstance(b, dict) and b.get("type") == "text" for b in blocks
+                    ) or isinstance(msg.get("content"), str)
+                    if is_real_prompt:
+                        current_texts = []
+                        last_tool = None
+                        last_context = ""
                     continue
-                for block in msg.get("content") or []:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        last = block
+                if role != "assistant":
+                    continue
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = block.get("text") or ""
+                        if text:
+                            current_texts.append(text)
+                    elif btype == "tool_use":
+                        last_tool = block
+                        last_context = "\n\n".join(current_texts).strip()
+                        current_texts = []  # reset for any following tool_use
     except OSError:
-        return None
-    return last
+        return None, ""
+    return last_tool, last_context
+
+
+def _find_last_tool_use(transcript_path: Path) -> dict[str, Any] | None:
+    """Back-compat shim — most callers want the tuple variant now."""
+    tool, _ = _find_pending_context(transcript_path)
+    return tool
 
 
 def _describe_tool_use(tool: dict[str, Any]) -> str | None:
@@ -369,9 +411,31 @@ def _describe_tool_use(tool: dict[str, Any]) -> str | None:
             first = questions[0] if isinstance(questions[0], dict) else {}
             q_text = str(first.get("question") or "").strip()
             multi = first.get("multiSelect")
+            options = first.get("options") or []
             suffix = " <i>(select all that apply)</i>" if multi else ""
+            lines: list[str] = []
             if q_text:
-                return f"❓ <b>{esc(q_text)}</b>{suffix}"
+                lines.append(f"❓ <b>{esc(q_text)}</b>{suffix}")
+            else:
+                lines.append(f"❓ <b>Question needs an answer</b>{suffix}")
+            # Render each option with its description so the user can
+            # pick intelligently — the inline-keyboard buttons carry
+            # only the label + number.
+            if isinstance(options, list):
+                for idx, opt in enumerate(options, start=1):
+                    if isinstance(opt, dict):
+                        label = str(opt.get("label") or f"Option {idx}")
+                        desc = str(opt.get("description") or "").strip()
+                    elif isinstance(opt, str):
+                        label = opt
+                        desc = ""
+                    else:
+                        continue
+                    line = f"<b>{idx}. {esc(label, 120)}</b>"
+                    if desc:
+                        line += f"\n    <i>{esc(desc, 200)}</i>"
+                    lines.append(line)
+            return "\n\n".join(lines)
         return "❓ <b>Question needs an answer</b>"
     if name == "Write":
         path = inp.get("file_path") or "?"
@@ -629,19 +693,26 @@ def main_notify() -> None:
     header = "  ·  ".join(header_parts)
 
     # For permission / elicitation notifications we augment the body with
-    # the actual pending tool_use (bash command, plan content, question,
-    # etc.) and tailor the reply keyboard — AskUserQuestion gets one
-    # button per option, ExitPlanMode gets Approve / Keep planning,
-    # everything else keeps the default Allow / Always / Deny row.
+    # (1) whatever Claude wrote just before the tool call (crucial for
+    # multi-choice prompts), (2) a rich description of the pending tool
+    # (command / plan body / question + option descriptions), and (3)
+    # a tailored reply keyboard. The preamble is quoted in a blockquote
+    # so it reads as "what Claude said" separate from our own framing.
     pending_tool: dict[str, Any] | None = None
+    pending_context: str = ""
     if notif_type in ("permission_prompt", "elicitation_dialog") and transcript_raw:
         path = Path(str(transcript_raw))
         if path.exists():
-            pending_tool = _find_last_tool_use(path)
+            pending_tool, pending_context = _find_pending_context(path)
 
     body_parts: list[str] = []
     if msg_text:
         body_parts.append(html.escape(msg_text))
+    if pending_context:
+        preview = pending_context
+        if len(preview) > 1200:
+            preview = preview[:1200].rstrip() + "…"
+        body_parts.append(f"<blockquote>{html.escape(preview)}</blockquote>")
     if pending_tool:
         detail = _describe_tool_use(pending_tool)
         if detail:
