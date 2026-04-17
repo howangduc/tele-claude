@@ -1020,6 +1020,123 @@ def main_post_tool_use() -> None:
         edit_message(chat_id, msg_id, text, parse_mode="HTML")
 
 
+def main_subagent_stop() -> None:
+    """Fires when a Task-spawned subagent finishes.
+
+    Clears the heartbeat throttle so the next PostToolUse (or a fresh
+    tick of this hook) re-renders ⏳ immediately — otherwise the user
+    can wait up to 5 s to see the subagent drop off `running_subagents`.
+    If a progress placeholder is tracked for this session, also edits
+    it in place with a "✓ subagent done: <agent_type>" line so the
+    completion is visible even without any subsequent activity.
+    """
+    data = _stdin_json()
+    session_id = str(data.get("session_id") or "unknown")
+    agent_type = str(data.get("agent_type") or "subagent")
+    transcript_raw = data.get("transcript_path")
+    cwd = str(data.get("cwd") or "")
+    pane_id = os.environ.get("TMUX_PANE", "")
+
+    state.touch_activity(session_id)
+
+    if pane_id and not state.is_subscribed(pane_id):
+        return
+    if pane_id and state.is_muted(pane_id):
+        return
+
+    # Reset throttle so the next PostToolUse tick refreshes the heartbeat.
+    state.clear_heartbeat(session_id)
+
+    if not transcript_raw:
+        return
+    transcript_path = Path(str(transcript_raw))
+    if not transcript_path.exists():
+        return
+
+    chat_ids = _chat_ids()
+    any_pending = any(
+        state.get_progress_msg_id(f"{session_id}:{c}") is not None for c in chat_ids
+    )
+    if not any_pending:
+        return
+
+    tool_count, last_tool, latest_text, running_subagents = _summarise_in_progress(
+        transcript_path
+    )
+    header = _build_header(cwd, pane_id, "⏳")
+    summary = (
+        f"<i>Working… {tool_count} tool call{'' if tool_count == 1 else 's'}"
+        + (f", last: <code>{html.escape(last_tool)}</code>" if last_tool else "")
+        + "</i>"
+    )
+    lines = [summary]
+    lines.append(
+        f"✓ subagent done: <code>{html.escape(_truncate(agent_type, 40))}</code>"
+    )
+    if running_subagents:
+        remaining = running_subagents[:5]
+        bullets = [f"🧑‍💻 {html.escape(_truncate(desc, 80))}" for desc in remaining]
+        lines.append("\n".join(bullets))
+    if latest_text:
+        preview = latest_text.strip()
+        if len(preview) > 600:
+            preview = preview[:600].rstrip() + "…"
+        lines.append(f"<blockquote expandable>{html.escape(preview)}</blockquote>")
+    text = f"{header}\n\n" + "\n\n".join(lines)
+
+    for chat_id in chat_ids:
+        msg_id = state.get_progress_msg_id(f"{session_id}:{chat_id}")
+        if msg_id is not None:
+            edit_message(chat_id, msg_id, text, parse_mode="HTML")
+
+
+def main_teammate_idle() -> None:
+    """Fires when a teammate in an Agent Team is about to go idle.
+
+    Sends a dedicated Telegram notification (NOT an edit of the main
+    ⏳ placeholder) so the user knows a specific teammate is waiting
+    for input. Pushes a real notification because this is a signal
+    to act — tap to message the teammate directly.
+    """
+    data = _stdin_json()
+    teammate_name = str(data.get("teammate_name") or "")
+    agent_type = str(data.get("agent_type") or "")
+    agent_id = str(data.get("agent_id") or "")
+    cwd = str(data.get("cwd") or "")
+    last_message = str(data.get("last_assistant_message") or "").strip()
+    pane_id = os.environ.get("TMUX_PANE", "")
+
+    if pane_id and state.is_muted(pane_id):
+        return
+
+    header_parts = ["🧑‍💻 <b>Teammate idle</b>"]
+    label = teammate_name or agent_type or "teammate"
+    header_parts.append(f"<code>{html.escape(_truncate(label, 40))}</code>")
+    project = _project(cwd)
+    if project:
+        header_parts.append(f"<code>{html.escape(project)}</code>")
+    header = "  ·  ".join(header_parts)
+
+    lines = [header]
+    if agent_type and teammate_name and agent_type != teammate_name:
+        lines.append(f"<i>role: <code>{html.escape(agent_type)}</code></i>")
+    if last_message:
+        preview = _truncate(last_message, 600)
+        lines.append(f"<blockquote expandable>{html.escape(preview)}</blockquote>")
+    text = "\n\n".join(lines)
+
+    # The teammate's `agent_id` disambiguates it in multi-team scenarios.
+    # The Send-msg button uses a force-reply on tap so the user can type
+    # a response that the bot (eventually) can route back — out of scope
+    # for this hook; for now, we simply notify.
+    for chat_id in _chat_ids():
+        send_message(chat_id, text, parse_mode="HTML")
+
+    # Debug-friendly: agent_id persists in the notification for audit but
+    # doesn't need surfacing unless we add routing. Keep the send simple.
+    _ = agent_id
+
+
 def main_pump() -> None:
     """Entry point for the typing-indicator pumper subprocess.
 
@@ -1056,7 +1173,15 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     _ = parser.add_argument(
-        "mode", choices=["notify", "reply", "progress", "post_tool_use"]
+        "mode",
+        choices=[
+            "notify",
+            "reply",
+            "progress",
+            "post_tool_use",
+            "subagent_stop",
+            "teammate_idle",
+        ],
     )
     args = parser.parse_args()
     handlers = {
@@ -1064,6 +1189,8 @@ def main() -> None:
         "reply": main_reply,
         "progress": main_progress,
         "post_tool_use": main_post_tool_use,
+        "subagent_stop": main_subagent_stop,
+        "teammate_idle": main_teammate_idle,
     }
     try:
         handlers[args.mode]()
