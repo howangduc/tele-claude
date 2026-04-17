@@ -101,7 +101,16 @@ def send_message(
     text: str,
     parse_mode: str | None = None,
     reply_markup: dict[str, Any] | None = None,
+    disable_notification: bool = False,
 ) -> int | None:
+    """Send a Telegram message.
+
+    When ``disable_notification=True`` the message lands silently —
+    still visible in the chat, but no push notification, no sound,
+    no badge increment. Used for ⏳ placeholders and secondary chunks
+    of a split reply so the user only gets ONE phone buzz per turn
+    (when the actual response arrives).
+    """
     resp = _call(
         "sendMessage",
         {
@@ -109,6 +118,7 @@ def send_message(
             "text": text,
             "parse_mode": parse_mode,
             "reply_markup": reply_markup,
+            "disable_notification": disable_notification or None,
         },
     )
     if resp.get("ok"):
@@ -133,6 +143,15 @@ def edit_message(
             "reply_markup": reply_markup,
         },
     )
+    return bool(resp.get("ok"))
+
+
+def delete_message(chat_id: str, message_id: int) -> bool:
+    """Delete a previously-sent message. Used to remove the ⏳ placeholder
+    before sending the real reply — that way the real reply is a fresh
+    send (which pushes a notification) rather than a silent edit.
+    """
+    resp = _call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
     return bool(resp.get("ok"))
 
 
@@ -807,7 +826,12 @@ def main_progress() -> None:
     text = f"{header}\n\n{body}"
 
     for chat_id in _chat_ids():
-        msg_id = send_message(chat_id, text, parse_mode="HTML")
+        # ⏳ placeholders go SILENT — the user just sent the prompt,
+        # they don't need a phone buzz confirming that. Only the final
+        # 🤖 reply (Stop hook) fires a push notification.
+        msg_id = send_message(
+            chat_id, text, parse_mode="HTML", disable_notification=True
+        )
         if msg_id is not None:
             state.set_progress_msg_id(f"{session_id}:{chat_id}", msg_id)
             _spawn_typing_pumper(session_id, chat_id)
