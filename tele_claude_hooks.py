@@ -398,13 +398,37 @@ def _describe_tool_use(tool: dict[str, Any]) -> str | None:
             return body
         return "<b>Bash</b>"
     if name == "ExitPlanMode":
+        # Plans can get big; Telegram caps messages at 4096 chars AFTER
+        # HTML conversion (which inflates by ~30 %). A single-message
+        # budget of ~3000 raw chars fits comfortably even with the
+        # outer framing (header, blockquote preamble, buttons). Longer
+        # plans go into a <blockquote expandable> which is collapsible
+        # on recent Telegram clients — still limited to 4096 total, but
+        # the visual footprint is compact so the buttons aren't scrolled
+        # off-screen on mobile.
         plan = str(inp.get("plan") or "").strip()
-        if plan:
-            if len(plan) > 2500:
-                plan = plan[:2500].rstrip() + "\n\n…(plan truncated, see pane)"
-            rendered = tele_claude_format.convert(plan)
-            return f"📋 <b>Plan to execute</b>\n\n{rendered}"
-        return "📋 <b>Plan approval requested</b>"
+        if not plan:
+            return "📋 <b>Plan approval requested</b>"
+        truncated = False
+        if len(plan) > 3000:
+            plan = (
+                plan[:3000].rstrip()
+                + "\n\n… _(plan truncated at 3000 chars — open pane to see full)_"
+            )
+            truncated = True
+        rendered = tele_claude_format.convert(plan)
+        # Expandable blockquote keeps long plans tidy and lets the user
+        # tap to expand. On older clients it gracefully degrades to a
+        # regular blockquote.
+        wrapper = (
+            f"<blockquote expandable>{rendered}</blockquote>"
+            if len(rendered) > 400
+            else rendered
+        )
+        header = "📋 <b>Plan to execute</b>"
+        if truncated:
+            header += " <i>(truncated)</i>"
+        return f"{header}\n{wrapper}"
     if name == "AskUserQuestion":
         questions = inp.get("questions") or []
         if isinstance(questions, list) and questions:

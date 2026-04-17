@@ -419,11 +419,19 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             return
         try:
             _send_to_tmux(pane_id, answer)
-            _ = await query.answer(f"→ {answer}")
-            _ = await query.edit_message_text(
-                f"{message.text}\n\n→ sent <code>{_html.escape(answer)}</code>",
-                parse_mode="HTML",
-            )
+            # Alert-style popup (needs a tap to dismiss) so the user gets
+            # unambiguous confirmation even if they miss the brief toast.
+            _ = await query.answer(f"✅ Sent {answer} → {pane_id}", show_alert=True)
+            # Drop the buttons so the message visually "commits" to the
+            # decision. We deliberately DON'T edit the body — the original
+            # message's HTML (plan, question text, preamble) is kept intact
+            # for scrollback. Editing the text risks re-parsing failures
+            # when the message contains nested tags or HTML-special chars,
+            # which manifests on the phone as "tap did nothing".
+            try:
+                _ = await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
         return
@@ -447,7 +455,11 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             return
         try:
             _send_key(pane_id, "C-c")
-            _ = await query.answer(f"🛑 {pane_id}")
+            _ = await query.answer(f"🛑 Ctrl-C → {pane_id}", show_alert=True)
+            try:
+                _ = await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
         return
