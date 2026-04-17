@@ -79,6 +79,9 @@ _BUILTIN_COMMANDS = {
     "mute",
     "unmute",
     "muted",
+    "subscribe",
+    "unsubscribe",
+    "subscribed",
     "history",
     "shortcut",
 }
@@ -138,10 +141,14 @@ def _pane_exists(pane_id: str) -> bool:
 def _send_to_tmux(pane_id: str, text: str) -> None:
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
+    # Any successful send-via-bot is an implicit subscribe — the user has
+    # clearly opted this pane into the Telegram conversation loop.
+    state.subscribe_pane(pane_id)
 
 
 def _send_key(pane_id: str, key: str) -> None:
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, key], check=True)
+    state.subscribe_pane(pane_id)
 
 
 def _resolve_pane(chat_id: int, message: Message) -> str | None:
@@ -167,20 +174,40 @@ async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     if not message or not _authorised(message.chat_id):
         return
     panes = _list_claude_panes()
+    alive_ids = {p for p, _ in panes}
+    # Purge any state pointing at panes that no longer exist so the UI
+    # never shows stale %IDs (active/subscribed/muted all get cleaned).
+    _ = state.prune_panes(alive_ids)
     if not panes:
         _ = await message.reply_text("No Claude Code panes found.")
         return
     active = state.get_active_pane(message.chat_id)
+    subscribed = state.get_subscribed_panes()
     muted = state.get_muted_panes()
     rows: list[list[InlineKeyboardButton]] = []
     for pane_id, path in panes:
-        badge = "● " if pane_id == active else ("🔕 " if pane_id in muted else "")
+        if pane_id == active:
+            badge = "● "
+        elif pane_id in muted:
+            badge = "🔕 "
+        elif pane_id in subscribed:
+            badge = "🔔 "
+        else:
+            badge = "· "  # unsubscribed — no forwarding yet
         label = f"{badge}{pane_id}  {_short_home(path)}"
         rows.append([InlineKeyboardButton(label, callback_data=f"use:{pane_id}")])
-    header = (
-        f"Active: {active}\n\nTap to switch:" if active else "Tap a pane to select it:"
+    subs_summary = (
+        f"{len(subscribed & alive_ids)}/{len(alive_ids)} subscribed"
+        if alive_ids
+        else "none"
     )
-    _ = await message.reply_text(header, reply_markup=InlineKeyboardMarkup(rows))
+    header_lines = [
+        f"Active: {active}" if active else "No active pane.",
+        f"Subscriptions: {subs_summary} · Tap to select (auto-subscribes):",
+    ]
+    _ = await message.reply_text(
+        "\n".join(header_lines), reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -196,7 +223,8 @@ async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     pane_id = _normalise_pane(args[0])
     state.set_active_pane(message.chat_id, pane_id)
-    _ = await message.reply_text(f"Active pane: {pane_id}")
+    state.subscribe_pane(pane_id)  # explicit pick = explicit subscription
+    _ = await message.reply_text(f"Active pane: {pane_id} 🔔 subscribed")
 
 
 async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,6 +286,42 @@ async def cmd_muted(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     muted = sorted(state.get_muted_panes())
     _ = await message.reply_text(
         "Muted: " + ", ".join(muted) if muted else "No muted panes."
+    )
+
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Explicitly subscribe a pane to hook forwarding."""
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    if not pane_id:
+        _ = await message.reply_text("Usage: /subscribe %N")
+        return
+    state.subscribe_pane(pane_id)
+    _ = await message.reply_text(f"🔔 Subscribed {pane_id}")
+
+
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a pane from hook forwarding. Hooks will exit silently for it."""
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    if not pane_id:
+        _ = await message.reply_text("Usage: /unsubscribe %N")
+        return
+    state.unsubscribe_pane(pane_id)
+    _ = await message.reply_text(f"🔕 Unsubscribed {pane_id} (hooks will skip it)")
+
+
+async def cmd_subscribed(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    subs = sorted(state.get_subscribed_panes())
+    _ = await message.reply_text(
+        "Subscribed: " + ", ".join(subs) if subs else "No subscribed panes."
     )
 
 
@@ -619,13 +683,16 @@ _Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Any]
 # (command_name, description, handler) — single source of truth for both
 # telegram.ext handler registration and the Telegram UI command menu.
 _COMMANDS: list[tuple[str, str, _Handler]] = [
-    ("panes", "List Claude Code panes (tap to activate)", cmd_panes),
+    ("panes", "List Claude Code panes (tap to activate+subscribe)", cmd_panes),
     ("use", "Set active pane: /use %N", cmd_use),
     ("which", "Show the active pane", cmd_which),
     ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
     ("mute", "Silence hooks: /mute %N", cmd_mute),
     ("unmute", "Re-enable hooks: /unmute %N", cmd_unmute),
     ("muted", "List muted panes", cmd_muted),
+    ("subscribe", "Subscribe pane to hooks: /subscribe %N", cmd_subscribe),
+    ("unsubscribe", "Stop hooks for pane: /unsubscribe %N", cmd_unsubscribe),
+    ("subscribed", "List subscribed panes", cmd_subscribed),
     ("history", "Capture pane output: /history %N [lines]", cmd_history),
     ("shortcut", "Manage Claude shortcuts (add/rm/list)", cmd_shortcut),
 ]

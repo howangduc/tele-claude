@@ -363,6 +363,11 @@ def main_reply() -> None:
     transcript_path = Path(str(transcript_raw))
     if not transcript_path.exists():
         return
+    # Subscription gate — hooks only forward from panes the user has
+    # interacted with via the bot. Panes with no TMUX_PANE at all are
+    # allowed through (best-effort degradation for edge cases).
+    if pane_id and not state.is_subscribed(pane_id):
+        return
     if pane_id and state.is_muted(pane_id):
         return
 
@@ -421,6 +426,8 @@ def main_notify() -> None:
     cwd = str(data.get("cwd") or "")
     pane_id = os.environ.get("TMUX_PANE", "")
 
+    if pane_id and not state.is_subscribed(pane_id):
+        return
     if pane_id and state.is_muted(pane_id):
         return
 
@@ -495,6 +502,8 @@ def main_progress() -> None:
 
     state.touch_activity(session_id)
 
+    if pane_id and not state.is_subscribed(pane_id):
+        return
     if pane_id and state.is_muted(pane_id):
         return
 

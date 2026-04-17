@@ -139,15 +139,35 @@ If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its ab
 | `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
 | `/which` | Shows the current active pane. |
 | `/cancel [%N]` | Sends **Ctrl-C** to a pane (active pane if `%N` omitted). Stops a runaway turn from your phone. |
-| `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane. |
+| `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane (still subscribed). |
 | `/unmute %N` | Resumes forwarding. |
 | `/muted` | Lists currently muted panes. |
+| `/subscribe %N` | Opts a pane into hook forwarding. Auto-triggered by any bot→pane send. |
+| `/unsubscribe %N` | Removes a pane from forwarding. Hooks exit silently for it. |
+| `/subscribed` | Lists subscribed panes. |
 | `/history %N [lines]` | Captures the last N lines (default 20, max 500) of a pane and sends them as a preformatted block. |
 | `/shortcut add <name> [desc]` | Registers a Claude slash-command so it shows up in Telegram's `/` autocomplete. Example: `/shortcut add sdlc Run the SDLC orchestrator`. |
 | `/shortcut rm <name>` | Removes a shortcut from the menu. |
 | `/shortcut list` | Shows all registered shortcuts. |
 
-State (active pane, mute list, shortcuts) persists in `~/.cache/tele-claude/state.json`, so bot restarts don't lose your selections. The same directory holds per-session ephemerals under `progress/`, `activity/`, `fingerprints/`, and cached inbound images under `images/`. Override the root with `export TELE_CLAUDE_STATE_DIR=/path` in `~/.config/tele-claude/env`.
+State (active pane, subscribed panes, mute list, shortcuts) persists in `~/.cache/tele-claude/state.json`, so bot restarts don't lose your selections. The same directory holds per-session ephemerals under `progress/`, `activity/`, `fingerprints/`, and cached inbound images under `images/`. Override the root with `export TELE_CLAUDE_STATE_DIR=/path` in `~/.config/tele-claude/env`.
+
+### Subscription model — hooks only forward from panes you've interacted with
+
+Even with `TELE_CLAUDE=1` set globally via the `claude` alias, **new tmux panes stay silent until you opt them in**. This prevents a newly-started Claude session from firing notifications at Telegram before you're ready for it.
+
+A pane becomes **subscribed** the moment you:
+- send any text, photo, or slash command to it via Telegram, OR
+- tap its button in `/panes`, OR
+- run `/use %N` or `/subscribe %N`
+
+Hooks (`Notification`, `Stop`, `UserPromptSubmit`) check the subscription set first; unsubscribed panes exit the hook silently. Pair with `/mute` for temporary silencing that keeps the subscription, or `/unsubscribe` for a harder opt-out. Dead panes are purged from the subscribed set every time you run `/panes`.
+
+Badges in `/panes`:
+- `●` active + subscribed
+- `🔔` subscribed, not active
+- `🔕` subscribed, muted
+- `·` alive but not subscribed (tap to opt in)
 
 > 💡 **Command menu.** The bot publishes this list to Telegram via `setMyCommands` on startup. Tap the **☰ Menu** button in the chat (or type `/`) to see all commands with descriptions and pick one by tap.
 

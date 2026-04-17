@@ -75,6 +75,74 @@ def set_active_pane(chat_id: int, pane_id: str) -> None:
     _save(state)
 
 
+# ---------- Subscribed panes (hooks only fire for these) ----------
+
+
+def get_subscribed_panes() -> set[str]:
+    data = _load().get("subscribed_panes", [])
+    return set(data) if isinstance(data, list) else set()
+
+
+def subscribe_pane(pane_id: str) -> None:
+    """Add a pane to the subscription set so hooks forward from it."""
+    state = _load()
+    subs = set(state.get("subscribed_panes", []) or [])
+    if pane_id in subs:
+        return
+    subs.add(pane_id)
+    state["subscribed_panes"] = sorted(subs)
+    _save(state)
+
+
+def unsubscribe_pane(pane_id: str) -> None:
+    state = _load()
+    subs = set(state.get("subscribed_panes", []) or [])
+    if pane_id not in subs:
+        return
+    subs.discard(pane_id)
+    state["subscribed_panes"] = sorted(subs)
+    _save(state)
+
+
+def is_subscribed(pane_id: str) -> bool:
+    return pane_id in get_subscribed_panes()
+
+
+def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
+    """Remove dead panes from every pane-keyed state section.
+
+    Returns (removed_subscribed, removed_muted) for user-facing reporting.
+    `active_pane` entries pointing at dead panes are also cleared.
+    """
+    state = _load()
+    changed = False
+
+    subs = set(state.get("subscribed_panes", []) or [])
+    dead_subs = subs - alive_pane_ids
+    if dead_subs:
+        state["subscribed_panes"] = sorted(subs - dead_subs)
+        changed = True
+
+    muted = set(state.get("muted_panes", []) or [])
+    dead_muted = muted - alive_pane_ids
+    if dead_muted:
+        state["muted_panes"] = sorted(muted - dead_muted)
+        changed = True
+
+    active = state.get("active_pane")
+    if isinstance(active, dict):
+        stale_chats = [c for c, p in active.items() if p not in alive_pane_ids]
+        for chat in stale_chats:
+            del active[chat]
+        if stale_chats:
+            state["active_pane"] = active
+            changed = True
+
+    if changed:
+        _save(state)
+    return dead_subs, dead_muted
+
+
 # ---------- Muted panes (global across chats) ----------
 
 
