@@ -681,21 +681,30 @@ def main_reply() -> None:
         progress_key = f"{session_id}:{chat_id}"
         progress_id = state.get_progress_msg_id(progress_key)
 
+        # Delete the ⏳ placeholder (if any) so the real reply arrives as
+        # a fresh sendMessage — which triggers a push notification.
+        # Editing the placeholder in place was silent (Telegram doesn't
+        # push on edits), meaning users missed responses on their phone.
+        if progress_id is not None:
+            _ = delete_message(chat_id, progress_id)
+
         for idx, piece_md in enumerate(chunks_md):
             piece_html = tele_claude_format.convert(piece_md)
             prefix = f"({idx + 1}/{total}) " if total > 1 else ""
             body = f"{prefix}{header}\n\n{piece_html}"
             is_last = idx == total - 1
             markup = last_markup if is_last else None
-
-            if idx == 0 and progress_id is not None:
-                ok = edit_message(
-                    chat_id, progress_id, body, parse_mode="HTML", reply_markup=markup
-                )
-                if not ok:
-                    send_message(chat_id, body, parse_mode="HTML", reply_markup=markup)
-            else:
-                send_message(chat_id, body, parse_mode="HTML", reply_markup=markup)
+            # First chunk pushes the notification (the user's signal that
+            # the turn completed). Subsequent chunks are silent so a
+            # multi-part reply only buzzes the phone once.
+            silent = idx > 0
+            send_message(
+                chat_id,
+                body,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_notification=silent,
+            )
 
         state.clear_progress(progress_key)
     # Turn done — reset the heartbeat throttle for the next turn.
