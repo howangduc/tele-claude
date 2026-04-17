@@ -1044,9 +1044,6 @@ def main_subagent_stop() -> None:
     if pane_id and state.is_muted(pane_id):
         return
 
-    # Reset throttle so the next PostToolUse tick refreshes the heartbeat.
-    state.clear_heartbeat(session_id)
-
     if not transcript_raw:
         return
     transcript_path = Path(str(transcript_raw))
@@ -1058,6 +1055,15 @@ def main_subagent_stop() -> None:
         state.get_progress_msg_id(f"{session_id}:{c}") is not None for c in chat_ids
     )
     if not any_pending:
+        return
+
+    # Safety floor: Telegram rate-limits to ~1 msg/sec per chat. Teams of
+    # N subagents finishing in a burst would otherwise fire N edits in
+    # ~100 ms, blowing past the limit. A 1.5 s minimum between SubagentStop
+    # edits keeps us well inside safety while still feeling responsive.
+    # This shares the same heartbeat timestamp file as PostToolUse, so
+    # the two never race against each other either.
+    if not state.should_heartbeat(session_id, min_interval_seconds=1.5):
         return
 
     tool_count, last_tool, latest_text, running_subagents = _summarise_in_progress(
