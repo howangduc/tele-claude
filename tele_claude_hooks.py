@@ -936,15 +936,32 @@ def main_post_tool_use() -> None:
     if not state.should_heartbeat(session_id):
         return  # throttled — another update came <5 s ago
 
-    tool_count, last_tool, latest_text = _summarise_in_progress(transcript_path)
+    tool_count, last_tool, latest_text, running_subagents = _summarise_in_progress(
+        transcript_path
+    )
     header = _build_header(cwd, pane_id, "⏳")
 
-    # Body: tool counter + optional preview of the most recent text block.
-    lines = [
+    # Body: tool counter + in-flight subagent list + optional text preview.
+    summary = (
         f"<i>Working… {tool_count} tool call{'' if tool_count == 1 else 's'}"
         + (f", last: <code>{html.escape(last_tool)}</code>" if last_tool else "")
         + "</i>"
-    ]
+    )
+    lines = [summary]
+    if running_subagents:
+        # Show up to 5 active subagents so big fan-outs don't blow the
+        # message budget. Descriptions are user-facing (from Task's
+        # `description` field) so escape and truncate defensively.
+        agents_preview = running_subagents[:5]
+        bullets = [
+            f"🧑‍💻 {html.escape(_truncate(desc, 80))}" for desc in agents_preview
+        ]
+        extra = (
+            f"\n<i>…and {len(running_subagents) - 5} more</i>"
+            if len(running_subagents) > 5
+            else ""
+        )
+        lines.append("\n".join(bullets) + extra)
     if latest_text:
         preview = latest_text.strip()
         if len(preview) > 600:
