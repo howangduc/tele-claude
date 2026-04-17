@@ -80,6 +80,29 @@ def _chat_ids() -> list[str]:
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
+_DEBUG_LOG = Path.home() / ".cache" / "tele-claude" / "debug" / "api-errors.log"
+
+
+def _log_api_error(method: str, body: dict[str, str], err: str) -> None:
+    """Append a one-line diagnostic to the debug log.
+
+    Silent catch-all in _call made chunk-send failures invisible — a 4-
+    of-4 reply would go silent-3-of-4 on a parse error and we'd never
+    know. The log captures just enough to localise issues without
+    leaking message bodies (the text payload is truncated to 200 chars).
+    """
+    try:
+        _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        preview = body.get("text", "")[:200].replace("\n", "\\n")
+        with _DEBUG_LOG.open("a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {method} "
+                f"err={err} text_preview={preview!r}\n"
+            )
+    except OSError:
+        pass
+
+
 def _call(method: str, data: dict[str, Any]) -> dict[str, Any]:
     body: dict[str, str] = {}
     for k, v in data.items():
@@ -92,8 +115,19 @@ def _call(method: str, data: dict[str, Any]) -> dict[str, Any]:
     try:
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
-    except Exception:
-        return {"ok": False}
+    except Exception as exc:
+        # Try to extract Telegram's actual error body from HTTPError so
+        # the log says "Bad Request: can't parse entities" instead of
+        # a generic catch-all. Falls back to str(exc) for network errors.
+        err_detail = str(exc)
+        body_read = getattr(exc, "read", None)
+        if callable(body_read):
+            try:
+                err_detail = body_read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                pass
+        _log_api_error(method, body, err_detail)
+        return {"ok": False, "description": err_detail}
 
 
 def send_message(
@@ -110,6 +144,12 @@ def send_message(
     no badge increment. Used for ⏳ placeholders and secondary chunks
     of a split reply so the user only gets ONE phone buzz per turn
     (when the actual response arrives).
+
+    Resilience: if the initial call fails with parse_mode=HTML, we
+    retry once as plain text (parse_mode=None) with the HTML entities
+    unescaped so the user at least sees the content. Silent HTML-parse
+    400s were previously causing whole chunks to vanish from split
+    replies — a 4-of-4 reply would arrive as 3-of-4 with no indication.
     """
     resp = _call(
         "sendMessage",
@@ -123,7 +163,35 @@ def send_message(
     )
     if resp.get("ok"):
         return int(resp["result"]["message_id"])
+    # HTML-parse failure? Degrade to plain text so the user still sees
+    # the content. Strip tags roughly — enough to rescue the chunk.
+    if parse_mode == "HTML":
+        fallback = _strip_html_tags(text)
+        resp = _call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": f"⚠️ <i>(HTML parse failed, sending as plain)</i>\n\n{fallback}",
+                "parse_mode": None,
+                "reply_markup": reply_markup,
+                "disable_notification": disable_notification or None,
+            },
+        )
+        if resp.get("ok"):
+            return int(resp["result"]["message_id"])
     return None
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_ENTITY_MAP = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'"}
+
+
+def _strip_html_tags(text: str) -> str:
+    """Best-effort tag strip + entity unescape for the plain-text fallback."""
+    plain = _TAG_RE.sub("", text)
+    for entity, char in _ENTITY_MAP.items():
+        plain = plain.replace(entity, char)
+    return plain
 
 
 def edit_message(
