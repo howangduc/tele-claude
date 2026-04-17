@@ -47,18 +47,27 @@ The bot detects Claude Code panes by matching `*claude*` against `pane_current_c
 2. Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
 3. Find `"chat":{"id":123456789}` in the response
 
-### 3. Set environment variables
+### 3. Create the credentials file
+
+Store the token and chat ID in a single config file so both the bot and the hooks (see below) can source it:
 
 ```bash
+mkdir -p ~/.config/tele-claude
+cat > ~/.config/tele-claude/env << 'EOF'
 export CLAUDE_TELEGRAM_BOT_TOKEN="your-bot-token"
 export CLAUDE_TELEGRAM_CHAT_ID="your-chat-id"
+EOF
+chmod 600 ~/.config/tele-claude/env
 ```
+
+> **Multi-user ACL.** `CLAUDE_TELEGRAM_CHAT_ID` accepts a comma-separated list: `"123,456,789"`. Every listed chat can issue commands and receives forwarded notifications/replies. Anyone not on the list is ignored silently.
 
 ### 4. Run the bot
 
 Run directly with `uvx` (no clone needed):
 
 ```bash
+. ~/.config/tele-claude/env
 uvx --from git+https://github.com/chiendo97/tele-claude tele-claude
 ```
 
@@ -67,68 +76,234 @@ Or clone and run locally:
 ```bash
 git clone https://github.com/chiendo97/tele-claude.git
 cd tele-claude
+. ~/.config/tele-claude/env
 uv run tele-claude
 ```
 
+The package also exposes a standalone `tele-claude-format` script (defined in `[project.scripts]`). It reads markdown from stdin and writes Telegram HTML to stdout — handy for ad-hoc previews: `echo '# hi\n\n**bold**' | uv run tele-claude-format`.
+
+Run it in a detached tmux session so it survives your terminal closing:
+
+```bash
+tmux new -d -s tele-claude '. ~/.config/tele-claude/env && uv run tele-claude'
+tmux attach -t tele-claude   # view logs
+```
+
+#### Running as a systemd user service (recommended)
+
+For a bot that survives reboots and auto-restarts on crashes, install it as a user service instead of tmux:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/tele-claude.service <<'EOF'
+[Unit]
+Description=tele-claude Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tele-claude
+ExecStart=/bin/bash -c '. %h/.config/tele-claude/env && exec uv run tele-claude'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now tele-claude.service
+loginctl enable-linger "$USER"   # keep the service running after logout
+```
+
+Operate it:
+
+```bash
+systemctl --user status tele-claude          # health
+systemctl --user restart tele-claude         # after code changes
+journalctl --user -u tele-claude -f          # tail logs
+```
+
+If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its absolute path (e.g. `exec /home/you/miniconda3/bin/uv run tele-claude`).
+
 ## Usage
 
-### `/panes` command
+### Commands
 
-Lists all tmux panes currently running Claude Code. Each pane is sent as a separate message showing the pane ID and working directory:
+| Command | What it does |
+|---------|--------------|
+| `/panes` | Lists Claude Code panes as tappable buttons. Tapping a button sets the **active pane**. Muted panes show a 🔕 badge; the active pane shows ●. |
+| `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
+| `/which` | Shows the current active pane. |
+| `/cancel [%N]` | Sends **Ctrl-C** to a pane (active pane if `%N` omitted). Stops a runaway turn from your phone. |
+| `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane. |
+| `/unmute %N` | Resumes forwarding. |
+| `/muted` | Lists currently muted panes. |
+| `/history %N [lines]` | Captures the last N lines (default 20, max 500) of a pane and sends them as a preformatted block. |
+| `/shortcut add <name> [desc]` | Registers a Claude slash-command so it shows up in Telegram's `/` autocomplete. Example: `/shortcut add sdlc Run the SDLC orchestrator`. |
+| `/shortcut rm <name>` | Removes a shortcut from the menu. |
+| `/shortcut list` | Shows all registered shortcuts. |
 
-```
-%21 ~/Source/genbook-api
-%72 ~/Source/pipelines
-```
+State (active pane, mute list, shortcuts) persists in `~/.cache/tele-claude/state.json`, so bot restarts don't lose your selections. The same directory holds per-session ephemerals under `progress/`, `activity/`, `fingerprints/`, and cached inbound images under `images/`. Override the root with `export TELE_CLAUDE_STATE_DIR=/path` in `~/.config/tele-claude/env`.
+
+> 💡 **Command menu.** The bot publishes this list to Telegram via `setMyCommands` on startup. Tap the **☰ Menu** button in the chat (or type `/`) to see all commands with descriptions and pick one by tap.
 
 ### Sending messages to Claude Code
 
-Reply to any message containing a tmux pane ID (e.g. `%21`) with the text you want to send. The bot will feed it into that pane via `tmux send-keys`.
+Three ways — whichever feels most natural:
 
-## Optional: Claude Code notification hook
+1. **Active-pane flow** *(recommended for long chats)* — pick a pane once via `/panes` or `/use %N`. Every normal message goes to that pane until you switch.
+2. **Reply flow** — reply to any message that contains a pane ID (`%N`): bot confirmations, `/panes` listings, and 🤖 Claude replies all work.
+3. **Quick-reply buttons** *(disabled by default; flip `_quick_reply_keyboard()` in `tele_claude_hooks.py` to re-enable)* — inline keyboard with `y` / `n` / `continue` / `/clear` / 🛑 ESC buttons under each 🤖 reply. Shipped off because plain typing into the chat turns out to be faster than tapping buttons for most flows.
 
-You can configure Claude Code to send Telegram notifications when it needs your attention (permission prompts, idle, etc.) — and reply directly to those notifications to send input back.
+### Triggering Claude slash commands from your phone
 
-### 1. Create the hook script
+Claude Code's in-session commands (`/sdlc`, `/using-superpowers`, `/brainstorming`, anything from your skill set) can be invoked from Telegram in three complementary ways:
 
-Save this as `~/.claude/hooks/telegram-notify.sh`:
+1. **Autocomplete-driven (zero typos, with args)** — in the Telegram chat, tap the text input and type `/`. Your registered shortcuts appear in the suggestion popup **above** the input bar. Tap one → command name is inserted into the input → finish the args → send. Manage the list with `/shortcut add <name> [description]`, `/shortcut rm <name>`, `/shortcut list`.
+2. **☰ Menu-tap (one tap, then ForceReply prompts for args)** — tap the ☰ menu button next to the input bar and pick a shortcut. Telegram sends it immediately as a bare command. The bot detects it's a registered shortcut with no args and replies with a <kbd>ForceReply</kbd> prompt: *"Args for /sdlc?"*. Type your args and hit send — bot forwards `/sdlc <your args>` to the active pane. Send `.` (or any of `-`, `go`, `skip`, `bare`, empty) to forward bare.
+3. **Direct typing** — send any message that starts with `/`. Anything unknown to the bot is forwarded verbatim. `/sdlc audit --fix` → pane receives exactly that.
+
+**Why both #1 and #2?** Power users prefer autocomplete (fastest), but ☰ Menu is friendlier when typing is hard (driving, walking, small screen). The ForceReply prompt from #2 gives you a structured input field with a hint placeholder — no need to remember the command name a second time.
+
+**Why the hyphen handling is tricky.** Telegram's bot command names are restricted to `[a-z0-9_]{1,32}` — **no hyphens allowed**. For shortcuts like `using-superpowers` the bot registers `using_superpowers` (underscores) in Telegram's menu, and the forwarding handler converts back to the canonical hyphenated form before sending to the pane. This is transparent to you — you see the Claude name in `/shortcut list`, Telegram shows the underscore version in its autocomplete, and the pane receives the hyphenated original.
+
+**Preloaded shortcuts on fresh install.** None by default — run `/shortcut add <name>` for each Claude command you use often. Keep the list lean (5-10 favourites) so the autocomplete stays skimmable.
+
+### Sending images to Claude Code
+
+Attach any photo (or forward one) to the bot chat and it goes straight to the active pane — same resolution rules as text.
+
+- **Photo** (compressed, default when you attach from gallery) and **Document** image (original quality, sent "as file") are both accepted
+- Saved under `~/.cache/tele-claude/images/tg_<msg_id>_<file_unique_id>.<ext>` — deterministic, dedup-safe
+- Claude Code picks up the absolute path and loads the image via its vision capability
+- **With a caption**: the caption is sent first (on its own line), then the path — Claude reads the instruction and the image together: `check this screenshot for errors\n/home/you/.cache/tele-claude/images/tg_123_abc.jpg`
+- **Without a caption**: just the path — follow up with text afterwards and Claude remembers the image
+- Override destination via `export TELE_CLAUDE_IMAGE_DIR=/path/to/dir` in `~/.config/tele-claude/env`
+
+> **Albums (multiple photos in one send):** Telegram delivers each as its own message; the bot forwards them one by one in order.
+
+### Permission prompts from your phone
+
+When Claude Code asks for permission, you get a 🔐 message with three buttons:
+
+- **1 · Allow once** — sends `1` to the pane
+- **2 · Always** — sends `2`
+- **3 · Deny** — sends `3`
+
+No need to type — tap and go. (The digits match Claude Code's default permission UI.)
+
+### Progress indicator
+
+When the bot forwards your prompt to a pane, Claude Code's `UserPromptSubmit` hook immediately replies with an ⏳ placeholder message that includes a preview of what you sent. When Claude finishes its turn, the `Stop` hook **edits that same message** into the formatted response. You get one message per turn that evolves in place — no clutter.
+
+## Optional: Claude Code integration (bidirectional)
+
+The base bot is one-way: Telegram → tmux. Three Claude Code hooks close the loop:
+
+| Hook | Fires when | What it does |
+|------|------------|--------------|
+| `UserPromptSubmit` | You (or the bot) submit a prompt to Claude | Sends an ⏳ placeholder to Telegram with a preview |
+| `Stop` | Claude finishes a turn | Edits that placeholder into the full response (or sends new if no placeholder) |
+| `Notification` | Claude needs attention (permission, idle) | Sends 🔐 / 💤 to Telegram — permission prompts include Allow/Always/Deny buttons |
+
+All three share an opt-in gate: they exit silently unless `TELE_CLAUDE=1` is set on the Claude process. Aliasing `claude` to set that flag makes forwarding on-by-default; opting out for a single session is `command claude` or `TELE_CLAUDE=0 claude`.
+
+```
+Claude in pane %21                        Telegram
+       |                                       |
+       | (you tap the active pane message)     |
+       | <---- "fix the failing test" ---------|  bot → tmux send-keys
+       |                                       |
+       | UserPromptSubmit ─────── ⏳ placeholder ──────→  ⏳ project · %21
+       |                                                   "fix the failing test"
+       |                                       |
+       | Claude runs tools, reasons, writes…   |
+       |                                       |
+       | Stop ──────── edits placeholder ───→  🤖 project · %21
+       |                                                   "<formatted response>"
+       |                                                   [🔗 Open PR #42]
+       |                                       |
+       | (you type a reply in the chat)        |
+       | <------------- "keep going" ----------|  bot → tmux send-keys
+       |                                       |
+       | Notification (permission) ─── 🔐 ───→  🔐 Permission needed · %21
+       |                                                   [1 Allow once] [2 Always] [3 Deny]
+       | <------------- "1" -------------------|  callback → tmux send-keys
+```
+
+### 1. Reuse the credentials file
+
+All hooks source `~/.config/tele-claude/env` (created in [Setup → step 3](#3-create-the-credentials-file)) so you don't need to export secrets in every shell.
+
+### 2. Make `claude` forward by default
+
+Append to `~/.bashrc` (or `~/.zshrc`):
+
+```bash
+# tele-claude: every `claude` forwards to Telegram by default
+alias claude='TELE_CLAUDE=1 command claude'
+```
+
+Usage:
+
+| Command | Behavior |
+|---------|----------|
+| `claude` | Forwards notifications + responses to Telegram |
+| `command claude` | Runs Claude silently (bypasses the alias) |
+| `TELE_CLAUDE=0 claude` | One-off silent override |
+
+> Prefer explicit opt-in? Use `tclaude() { TELE_CLAUDE=1 claude "$@"; }` and invoke `tclaude` on the sessions you want forwarded, plain `claude` for the rest.
+
+### 3. Install the hook wrappers
+
+Hook logic lives in Python modules in this repo (`tele_claude_hooks.py`, `tele_claude_format.py`, `tele_claude_state.py`). The shell hooks are thin wrappers that exec the Python module — keeps curl/jq complexity out of bash and lets the hooks build inline keyboards, dedup, and split long messages.
+
+Save as `~/.claude/hooks/telegram-notify.sh`:
 
 ```bash
 #!/usr/bin/env bash
-BOT_TOKEN="${CLAUDE_TELEGRAM_BOT_TOKEN:?Missing CLAUDE_TELEGRAM_BOT_TOKEN}"
-CHAT_ID="${CLAUDE_TELEGRAM_CHAT_ID:?Missing CLAUDE_TELEGRAM_CHAT_ID}"
-
-INPUT=$(cat)
-NOTIFICATION_TYPE=$(echo "$INPUT" | jq -r '.notification_type // "unknown"')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-
-case "$NOTIFICATION_TYPE" in
-  permission_prompt)  EMOJI="🔐"; LABEL="Permission needed" ;;
-  idle_prompt)        EMOJI="💤"; LABEL="Waiting for input" ;;
-  *)                  EMOJI="🔔"; LABEL="Notification" ;;
-esac
-
-PROJECT="${CWD:+$(basename "$CWD")}"
-PANE_ID="${TMUX_PANE:-}"
-
-TEXT="${EMOJI} <b>${LABEL}</b>"
-[ -n "$PROJECT" ] && TEXT="${TEXT}  ·  <code>${PROJECT}</code>"
-[ -n "$PANE_ID" ] && TEXT="${TEXT}  ·  <code>${PANE_ID}</code>"
-
-curl -s --connect-timeout 5 --max-time 10 \
-  -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-  --data-urlencode "chat_id=$CHAT_ID" \
-  --data-urlencode "parse_mode=HTML" \
-  --data-urlencode "text=$TEXT" > /dev/null 2>&1
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" notify
 ```
 
-Make it executable:
+Save as `~/.claude/hooks/telegram-reply.sh`:
 
 ```bash
-chmod +x ~/.claude/hooks/telegram-notify.sh
+#!/usr/bin/env bash
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" reply
 ```
 
-### 2. Configure Claude Code
+Save as `~/.claude/hooks/telegram-progress.sh`:
+
+```bash
+#!/usr/bin/env bash
+[ "${TELE_CLAUDE:-}" = "1" ] || exit 0
+CONFIG="$HOME/.config/tele-claude/env"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HOME_DIR="${TELE_CLAUDE_HOME:-$HOME/tele-claude}"
+exec python3 "$HOME_DIR/tele_claude_hooks.py" progress
+```
+
+Make them executable:
+
+```bash
+chmod +x ~/.claude/hooks/telegram-{notify,reply,progress}.sh
+```
+
+> **Where the repo lives.** All three wrappers look for the Python module at `~/tele-claude/tele_claude_hooks.py`. Cloned elsewhere? Add `export TELE_CLAUDE_HOME=/path/to/repo` to `~/.config/tele-claude/env`.
+
+### 4. Register the hooks
 
 Add to `~/.claude/settings.json`:
 
@@ -139,10 +314,23 @@ Add to `~/.claude/settings.json`:
       {
         "matcher": "",
         "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude/hooks/telegram-notify.sh"
-          }
+          { "type": "command", "command": "~/.claude/hooks/telegram-notify.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/telegram-reply.sh" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/telegram-progress.sh" }
         ]
       }
     ]
@@ -150,16 +338,73 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-Now when Claude Code sends a notification like:
+### 5. Try it
 
-```
-🔐 Permission needed  ·  genbook-api  ·  %21
+```bash
+source ~/.bashrc       # picks up the claude alias
+tmux new -s work       # or attach an existing pane
+claude                 # forwarding is on by default
 ```
 
-You can reply to it directly in Telegram, and the bot will forward your message to pane `%21`.
+From Telegram:
+
+1. `/panes` → tap your pane to activate it
+2. Send any message → goes straight to the pane (no reply-to needed)
+3. ⏳ placeholder appears immediately with a preview of your prompt
+4. When Claude finishes, the placeholder edits in place to the formatted 🤖 response with inline buttons for quick replies and any links in the output
+5. Tap `continue`, `y`, `/clear`, or any `🔗 Open …` button to act — or type a new message
+
+### What the reply hook does for you
+
+- **Markdown → Telegram HTML** via `tele_claude_format.py` (headers → bold, `**foo**` → `<b>foo</b>`, fenced blocks → `<pre><code>`). **Tables adapt to width**: narrow tables (≤ 34 chars total) render as aligned `<pre>` monospace blocks with Unicode separators; wider tables flatten to vertical bullet blocks (`• <b>label</b>\n  → value` for 2-col, labeled sub-lines for 3+) because Telegram mobile wraps `<pre>` instead of scrolling horizontally. Tune via `_PRE_MAX_WIDTH` in the formatter
+- **HTML-aware smart split** — markdown is chunked, each chunk is converted to HTML, and the raw-markdown budget shrinks iteratively (2500 → 800 chars) until every chunk's HTML form fits under Telegram's 4096-char limit. Prevents silent 400s from tag-inflated messages
+- **Race-safe transcript read** — Claude Code's JSONL writer is buffered, so the Stop hook can fire a few hundred ms before the final text block is flushed to disk. The hook polls the transcript until two consecutive reads return the same text (max 1.5 s), guaranteeing it sees the complete turn
+- **Typing indicator while Claude works** — the UserPromptSubmit hook detaches a pumper subprocess that re-sends `sendChatAction=typing` every 4 s so Telegram shows a live "is typing…" status in the chat header. The pumper exits automatically the instant the Stop hook clears the progress file (≤ 4 s lag) or after a hard 10-min cap if Stop never fires
+- **Idle-prompt throttling** — Claude Code's `idle_prompt` fires on a hardcoded 60 s timer ([feature request](https://github.com/anthropics/claude-code/issues/13922) for configurability still open). The notify hook suppresses it unless the session has been genuinely silent for `$TELE_CLAUDE_IDLE_MIN_SECONDS` (default **900 s / 15 min**). Both `UserPromptSubmit` and `Stop` hooks count as activity. Override per install by adding e.g. `export TELE_CLAUDE_IDLE_MIN_SECONDS=600` to `~/.config/tele-claude/env`
+- **Dedup** — identical bodies sent within 5 s for the same session are skipped (silences re-fires)
+- **Mute aware** — panes muted via `/mute %N` get no reply hook at all
+- **URL extraction** — up to 4 `http(s)://` links in the reply become `🔗 Open <last-path-segment>` buttons under the message
+- **Quick-reply keyboard** *(disabled by default)* — `y` / `n` / `continue` / `/clear` / 🛑 ESC buttons; `tele_claude_hooks.py:_quick_reply_keyboard` returns `[]` — flip back to a populated list to re-enable
+
+### Caveats
+
+- **Per-session ⏳/🤖 editing** requires the UserPromptSubmit + Stop pair — if only Stop fires, you get a new message instead of an edit. Harmless but noisier.
+- **Text blocks only** — tool calls and tool results are not forwarded (keeps noise down).
+- **`TELE_CLAUDE` is session-scoped** — subagents and background jobs spawned from that session inherit it.
+- **Shell aliases only apply to interactive shells** — scripts that call `claude` non-interactively bypass the alias and run silently. That's usually what you want.
+- **Progress/dedup state lives in `~/.cache/tele-claude/`** — delete that directory to reset everything.
 
 ## Security notes
 
-- Only messages from the configured `CLAUDE_TELEGRAM_CHAT_ID` are processed
+- Only chats listed in `CLAUDE_TELEGRAM_CHAT_ID` (comma-separated) are processed; everyone else is ignored silently
 - Text is sent to tmux using the `-l` (literal) flag to prevent shell metacharacter interpretation
 - The bot uses long polling (no webhook/exposed server needed)
+- Callback data on inline buttons includes the `%PANE` it targets — the bot validates the pane still exists before acting
+- Credentials live in `~/.config/tele-claude/env` (chmod 600) and a single `Cache-Control` state file at `~/.cache/tele-claude/state.json`
+
+## Future work: forum-mode topics (one thread per pane)
+
+Currently all panes share a single Telegram chat. Responses and notifications from different panes interleave, and you rely on the `%PANE` tag in the header to know what's what. Telegram's **forum mode** (supergroups with "Topics" enabled) would give each pane its own thread — visually clean separation of concurrent work, especially when running 3+ Claude sessions in parallel.
+
+### Design sketch
+
+1. **Migrate the chat** from private 1:1 to a supergroup with topics enabled (via Bot API `createForumTopic`)
+2. **Map pane_id → topic_id** — stored in `state.json` under a new `topics` key. Created lazily: first time a pane fires a hook, the bot creates a topic named `project · %21` and caches the ID
+3. **All send calls acquire `message_thread_id`** — both the bot's command replies and the hooks' `sendMessage`. Bot helpers get a `pane_to_thread(pane_id)` accessor
+4. **Active pane becomes less central** — the topic you're viewing *is* the active pane. The active-pane state and `/use` command would still work as a fallback for the root chat
+5. **Topic lifecycle** — when a pane dies, optionally `closeForumTopic` or rename it to `🪦 %21 (closed)`. Garbage-collect in a periodic job or on `/panes` refresh
+
+### Open questions
+
+- **Migration cost** — moving from private chat to supergroup loses message history. Either run both in parallel during transition or accept the reset
+- **Rate limits** — creating many topics in a burst (20+ panes at once) may hit Telegram's `createForumTopic` rate limit. Throttle + exponential backoff needed
+- **Permissions** — topics in supergroups need the bot added as admin with `can_manage_topics` permission. Document this in setup
+- **Fallback when topics disabled** — gracefully degrade to single-thread mode if the chat isn't a forum (detect via `getChat`)
+- **Per-topic ACL** — `CLAUDE_TELEGRAM_CHAT_ID` stays the allowlist; topic_id is only a destination, not a gate
+
+### Blocked on
+
+- Stabilizing the commands + hooks from this PR (currently implemented features) in real use for a week or two. Forum mode is a restructuring that's hard to reverse; better to confirm current UX is solid first
+- Deciding on migration strategy (fresh supergroup vs. convert private chat vs. parallel running)
+
+No implementation yet — this section is the design anchor.

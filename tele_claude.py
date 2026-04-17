@@ -1,100 +1,666 @@
+"""Telegram bot that forwards messages to Claude Code tmux panes.
+
+Features
+  /panes          — tappable keyboard of Claude Code panes; tap to activate.
+  /use %N         — set active pane without the picker.
+  /which          — show the active pane.
+  /cancel [%N]    — send Ctrl-C to a pane (active if omitted).
+  /mute %N        — silence Notification + Stop hooks for that pane.
+  /unmute %N      — re-enable hooks.
+  /muted          — list muted panes.
+  /history %N [n] — capture and send the last N lines of a pane.
+
+Callback handlers (from inline keyboards placed by hooks or by /panes):
+  use:%N          — activate a pane.
+  ans:%N:1|2|3    — send a digit to a pane (permission prompt answers).
+  qr:%N:<text>    — quick-reply text to a pane.
+  cancel:%N       — send Ctrl-C to a pane.
+
+Fallback for plain-text messages: resolve pane from a reply-to `%N`,
+otherwise the active pane for that chat.
+"""
+
+from __future__ import annotations
+
+import html as _html
+import logging
 import os
 import re
 import subprocess
-import logging
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    BotCommand,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import tele_claude_state as state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["CLAUDE_TELEGRAM_BOT_TOKEN"]
-CHAT_ID = int(os.environ["CLAUDE_TELEGRAM_CHAT_ID"])
+CHAT_IDS: frozenset[int] = frozenset(
+    int(chunk.strip())
+    for chunk in os.environ["CLAUDE_TELEGRAM_CHAT_ID"].split(",")
+    if chunk.strip()
+)
+
+# Where to stash inbound images so Claude Code can pick them up via file path.
+IMAGE_DIR = Path(
+    os.environ.get("TELE_CLAUDE_IMAGE_DIR")
+    or str(Path.home() / ".cache" / "tele-claude" / "images")
+)
+
+_PANE_RE = re.compile(r"(?<!\w)%\d+(?!\w)")
+
+# Built-in bot commands that should NEVER be forwarded to a pane
+# (checked by the slash-passthrough handler to avoid double-processing).
+_BUILTIN_COMMANDS = {
+    "panes",
+    "use",
+    "which",
+    "cancel",
+    "mute",
+    "unmute",
+    "muted",
+    "history",
+    "shortcut",
+}
+
+# Prefix used on our "waiting for args" prompt messages. The reply handler
+# detects these by checking reply_to_message.text against this prefix, then
+# extracts the canonical command name from the rest of the line.
+_ARGS_PROMPT_PREFIX = "Args for /"
+
+# Reply text values that mean "send the command without any args".
+_SKIP_ARGS_TOKENS = frozenset({"", ".", "-", "/", "skip", "go", "bare"})
 
 
-def list_claude_panes() -> list[tuple[str, str]]:
-    """List tmux panes running Claude Code. Returns [(pane_id, path), ...]."""
+def _authorised(chat_id: int) -> bool:
+    return chat_id in CHAT_IDS
+
+
+def _short_home(path: str) -> str:
+    return path.replace(os.path.expanduser("~"), "~")
+
+
+def _normalise_pane(raw: str) -> str:
+    return raw if raw.startswith("%") else f"%{raw.lstrip('%')}"
+
+
+def _list_claude_panes() -> list[tuple[str, str]]:
     result = subprocess.run(
-        ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_current_path}",
-         "-f", "#{m:*claude*,#{pane_current_command}}"],
-        capture_output=True, text=True,
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_current_path}",
+            "-f",
+            "#{m:*claude*,#{pane_current_command}}",
+        ],
+        capture_output=True,
+        text=True,
     )
     panes: list[tuple[str, str]] = []
     for line in result.stdout.strip().splitlines():
         if line:
-            parts = line.split(" ", 1)
-            panes.append((parts[0], parts[1]))
+            pane_id, _, path = line.partition(" ")
+            panes.append((pane_id, path))
     return panes
 
 
-def send_to_tmux(pane_id: str, text: str) -> None:
-    """Send text to a tmux pane via send-keys with literal flag."""
+def _pane_exists(pane_id: str) -> bool:
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+        capture_output=True,
+        text=True,
+    )
+    return pane_id in result.stdout.split()
+
+
+def _send_to_tmux(pane_id: str, text: str) -> None:
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
 
 
-def extract_pane_id(text: str) -> str | None:
-    """Extract tmux pane ID from a message.
-
-    Searches for %N pattern anywhere in the text.
-    """
-    match = re.search(r"(?<!\w)%\d+(?!\w)", text)
-    return match.group(0) if match else None
+def _send_key(pane_id: str, key: str) -> None:
+    _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, key], check=True)
 
 
-async def panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+def _resolve_pane(chat_id: int, message: Message) -> str | None:
+    reply_to = message.reply_to_message
+    if reply_to and reply_to.text:
+        match = _PANE_RE.search(reply_to.text)
+        if match:
+            return match.group(0)
+    return state.get_active_pane(chat_id)
+
+
+def _pane_arg_or_active(chat_id: int, args: list[str]) -> str | None:
+    if args:
+        return _normalise_pane(args[0])
+    return state.get_active_pane(chat_id)
+
+
+# ---------- Commands ----------
+
+
+async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    if not message:
+    if not message or not _authorised(message.chat_id):
         return
-    if message.chat_id != CHAT_ID:
-        return
-
-    claude_panes = list_claude_panes()
-    if not claude_panes:
+    panes = _list_claude_panes()
+    if not panes:
         _ = await message.reply_text("No Claude Code panes found.")
         return
+    active = state.get_active_pane(message.chat_id)
+    muted = state.get_muted_panes()
+    rows: list[list[InlineKeyboardButton]] = []
+    for pane_id, path in panes:
+        badge = "● " if pane_id == active else ("🔕 " if pane_id in muted else "")
+        label = f"{badge}{pane_id}  {_short_home(path)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"use:{pane_id}")])
+    header = (
+        f"Active: {active}\n\nTap to switch:" if active else "Tap a pane to select it:"
+    )
+    _ = await message.reply_text(header, reply_markup=InlineKeyboardMarkup(rows))
 
-    for pane_id, path in claude_panes:
-        short_path = path.replace(os.path.expanduser("~"), "~")
-        _ = await message.reply_text(f"{pane_id} {short_path}")
 
-
-async def handle_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    if not message:
+    if not message or not _authorised(message.chat_id):
         return
-    if message.chat_id != CHAT_ID:
+    args = list(context.args or [])
+    if not args:
+        current = state.get_active_pane(message.chat_id)
+        _ = await message.reply_text(
+            f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
+        )
         return
+    pane_id = _normalise_pane(args[0])
+    state.set_active_pane(message.chat_id, pane_id)
+    _ = await message.reply_text(f"Active pane: {pane_id}")
 
-    reply_to = message.reply_to_message
-    if not reply_to or not reply_to.text:
-        _ = await message.reply_text("Reply to a message containing a tmux pane ID (e.g. %0).")
-        return
 
-    pane_id = extract_pane_id(reply_to.text)
+async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    current = state.get_active_pane(message.chat_id)
+    _ = await message.reply_text(
+        f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
     if not pane_id:
-        _ = await message.reply_text("Could not find a tmux pane ID (e.g. %0) in the replied message.")
+        _ = await message.reply_text("Usage: /cancel %N (or set an active pane first)")
         return
-
-    user_text = message.text
-    if not user_text:
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(f"Pane {pane_id} no longer exists.")
         return
-
-    logger.info("Sending to tmux pane %s: %s", pane_id, user_text)
-
     try:
-        send_to_tmux(pane_id, user_text)
-        _ = await message.reply_text(f"Sent to pane {pane_id}", reply_to_message_id=message.message_id)
+        _send_key(pane_id, "C-c")
+        _ = await message.reply_text(f"🛑 Ctrl-C → {pane_id}")
     except subprocess.CalledProcessError as e:
-        _ = await message.reply_text(f"Failed to send to pane {pane_id}: {e}", reply_to_message_id=message.message_id)
+        _ = await message.reply_text(f"Failed: {e}")
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    if not pane_id:
+        _ = await message.reply_text("Usage: /mute %N")
+        return
+    state.mute_pane(pane_id)
+    _ = await message.reply_text(f"🔕 Muted {pane_id}")
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    if not pane_id:
+        _ = await message.reply_text("Usage: /unmute %N")
+        return
+    state.unmute_pane(pane_id)
+    _ = await message.reply_text(f"🔔 Unmuted {pane_id}")
+
+
+async def cmd_muted(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    muted = sorted(state.get_muted_panes())
+    _ = await message.reply_text(
+        "Muted: " + ", ".join(muted) if muted else "No muted panes."
+    )
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    pane_id: str | None = None
+    lines = 20
+    for arg in context.args or []:
+        if arg.startswith("%"):
+            pane_id = _normalise_pane(arg)
+        elif arg.isdigit():
+            lines = max(1, min(int(arg), 500))
+    if not pane_id:
+        pane_id = state.get_active_pane(message.chat_id)
+    if not pane_id:
+        _ = await message.reply_text("Usage: /history %N [lines]")
+        return
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _ = await message.reply_text(f"Failed: {e}")
+        return
+    body = result.stdout.rstrip()
+    if not body:
+        _ = await message.reply_text(f"Pane {pane_id} is empty.")
+        return
+    if len(body) > 3500:
+        body = "…\n" + body[-3500:]
+    safe = _html.escape(body, quote=False)
+    _ = await message.reply_text(
+        f"<b>{pane_id}</b> · last {lines} lines\n<pre>{safe}</pre>",
+        parse_mode="HTML",
+    )
+
+
+# ---------- Callback buttons ----------
+
+
+async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not isinstance(query.message, Message):
+        return
+    message = query.message
+    if not _authorised(message.chat_id):
+        return
+    data = query.data or ""
+
+    if data.startswith("use:"):
+        pane_id = data[4:]
+        state.set_active_pane(message.chat_id, pane_id)
+        _ = await query.answer(f"Active: {pane_id}")
+        _ = await query.edit_message_text(
+            f"Active pane: {pane_id}\n\nSend any message to forward it here."
+        )
+        return
+
+    if data.startswith("ans:"):
+        _, pane_id, answer = data.split(":", 2)
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            _send_to_tmux(pane_id, answer)
+            _ = await query.answer(f"→ {answer}")
+            _ = await query.edit_message_text(
+                f"{message.text}\n\n→ sent <code>{_html.escape(answer)}</code>",
+                parse_mode="HTML",
+            )
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+        return
+
+    if data.startswith("qr:"):
+        _, pane_id, text = data.split(":", 2)
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            _send_to_tmux(pane_id, text)
+            _ = await query.answer(f"→ {pane_id}: {text}")
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+        return
+
+    if data.startswith("cancel:"):
+        pane_id = data[len("cancel:") :]
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            _send_key(pane_id, "C-c")
+            _ = await query.answer(f"🛑 {pane_id}")
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+        return
+
+    _ = await query.answer()
+
+
+# ---------- Plain messages ----------
+
+
+async def cmd_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage Claude slash-command shortcuts: /shortcut add|rm|list [name] [desc]."""
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    if not args:
+        _ = await message.reply_text(
+            "Usage:\n"
+            "/shortcut add <name> [description]\n"
+            "/shortcut rm <name>\n"
+            "/shortcut list"
+        )
+        return
+    sub = args[0].lower()
+    if sub == "list":
+        shortcuts = state.get_claude_shortcuts()
+        if not shortcuts:
+            _ = await message.reply_text(
+                "No shortcuts yet. Add one with /shortcut add <name>"
+            )
+            return
+        lines = ["<b>Claude shortcuts:</b>"]
+        for name, desc in sorted(shortcuts.items()):
+            lines.append(f"• /{_html.escape(name)} — {_html.escape(desc)}")
+        _ = await message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+    if sub == "add":
+        if len(args) < 2:
+            _ = await message.reply_text("Usage: /shortcut add <name> [description]")
+            return
+        name = args[1].lstrip("/")
+        desc = " ".join(args[2:]) if len(args) > 2 else ""
+        state.add_claude_shortcut(name, desc)
+        await _publish_menu(context.application)
+        _ = await message.reply_text(f"Added shortcut /{name}. Menu refreshed.")
+        return
+    if sub == "rm":
+        if len(args) < 2:
+            _ = await message.reply_text("Usage: /shortcut rm <name>")
+            return
+        name = args[1].lstrip("/")
+        state.remove_claude_shortcut(name)
+        await _publish_menu(context.application)
+        _ = await message.reply_text(f"Removed shortcut /{name}. Menu refreshed.")
+        return
+    _ = await message.reply_text(f"Unknown subcommand: {sub}. Try /shortcut list")
+
+
+def _canonicalise_shortcut(incoming: str) -> str:
+    """Map Telegram's underscore-aliased shortcut back to its hyphenated form."""
+    shortcuts = state.get_claude_shortcuts()
+    if incoming in shortcuts:
+        return incoming
+    for stored in shortcuts:
+        if stored.replace("-", "_") == incoming:
+            return stored
+    return incoming
+
+
+async def _prompt_for_args(message: Message, canonical: str) -> None:
+    """Reply with a ForceReply prompt so the user can add args one-handed.
+
+    Inserted between ``on_slash_passthrough`` and the pane forward when a
+    known shortcut is invoked bare (no args). Users tapping from
+    Telegram's ☰ Menu button get a chance to dictate args; power users
+    who already supplied args in the original message skip this path.
+    """
+    shortcuts = state.get_claude_shortcuts()
+    description = shortcuts.get(canonical, "")
+    lines = [f"{_ARGS_PROMPT_PREFIX}{canonical}?"]
+    if description:
+        lines.append(f"<i>{_html.escape(description)}</i>")
+    lines.append("")
+    lines.append("Reply with your args, or send <code>.</code> to forward bare.")
+    _ = await message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=ForceReply(
+            input_field_placeholder=f"args for /{canonical}…",
+            selective=True,
+        ),
+    )
+
+
+async def _forward_shortcut_to_pane(
+    message: Message, canonical: str, args: str
+) -> None:
+    """Shared send path used by both the direct and ForceReply-reply flows."""
+    forward = f"/{canonical}" + (f" {args}" if args else "")
+    pane_id = _resolve_pane(message.chat_id, message)
+    if not pane_id:
+        _ = await message.reply_text(
+            "No active pane. Use /panes to pick one, or reply to a pane message."
+        )
+        return
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(
+            f"Pane {pane_id} no longer exists. /panes to pick a live one."
+        )
+        return
+    try:
+        _send_to_tmux(pane_id, forward)
+        _ = await message.reply_text(
+            f"→ {pane_id}: <code>{_html.escape(forward[:80])}</code>",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+    except subprocess.CalledProcessError as e:
+        _ = await message.reply_text(
+            f"Failed to send to pane {pane_id}: {e}",
+            reply_to_message_id=message.message_id,
+        )
+
+
+async def on_slash_passthrough(
+    update: Update, _context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Forward any unknown /command to the active pane, preserving original name.
+
+    If the user invoked a known shortcut BARE (no args), we intercept and
+    reply with a ForceReply prompt so they can add args without typing
+    the command name themselves (friendly to ☰ Menu tappers). Power users
+    who supplied args in the original message skip the prompt entirely.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return
+
+    first, _, rest = text.partition(" ")
+    cmd_name = first[1:]  # strip leading slash
+    if cmd_name in _BUILTIN_COMMANDS:
+        return  # handled by CommandHandler (safety net only)
+
+    canonical = _canonicalise_shortcut(cmd_name)
+    shortcuts = state.get_claude_shortcuts()
+    if canonical in shortcuts and not rest.strip():
+        await _prompt_for_args(message, canonical)
+        return
+
+    await _forward_shortcut_to_pane(message, canonical, rest.strip())
+
+
+async def on_photo(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Download an incoming image and hand its absolute path to the active pane.
+
+    Accepts both PHOTO (compressed) and Document.IMAGE (original quality).
+    Caption, if any, is forwarded before the path so Claude has context.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+
+    tg_file = None
+    suffix = "jpg"
+    if message.photo:
+        photo = message.photo[-1]
+        tg_file = await photo.get_file()
+        unique = photo.file_unique_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        tg_file = await message.document.get_file()
+        unique = message.document.file_unique_id
+        original = message.document.file_name or ""
+        if "." in original:
+            suffix = original.rsplit(".", 1)[-1].lower()
+    else:
+        return
+
+    pane_id = _resolve_pane(message.chat_id, message)
+    if not pane_id:
+        _ = await message.reply_text(
+            "No active pane. Use /panes to pick one, or reply to a pane message."
+        )
+        return
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(
+            f"Pane {pane_id} no longer exists. /panes to pick a live one."
+        )
+        return
+
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = IMAGE_DIR / f"tg_{message.message_id}_{unique}.{suffix}"
+    _ = await tg_file.download_to_drive(str(out_path))
+
+    caption = (message.caption or "").strip()
+    text = f"{caption}\n{out_path}" if caption else str(out_path)
+
+    logger.info("Image → tmux pane %s: %s (caption=%r)", pane_id, out_path, caption)
+    try:
+        _send_to_tmux(pane_id, text)
+        _ = await message.reply_text(
+            f"🖼 → {pane_id}", reply_to_message_id=message.message_id
+        )
+    except subprocess.CalledProcessError as e:
+        _ = await message.reply_text(
+            f"Failed to send to pane {pane_id}: {e}",
+            reply_to_message_id=message.message_id,
+        )
+
+
+async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+
+    # If this is a reply to one of our "Args for /cmd?" prompts, extract the
+    # canonical command and forward. Users can send "." (or similar tokens) to
+    # forward the command bare instead of with arguments.
+    reply_to = message.reply_to_message
+    if reply_to and reply_to.text and reply_to.text.startswith(_ARGS_PROMPT_PREFIX):
+        header = reply_to.text[len(_ARGS_PROMPT_PREFIX) :]
+        canonical = header.split("?", 1)[0].strip()
+        if canonical:
+            raw_args = (message.text or "").strip()
+            args = "" if raw_args.lower() in _SKIP_ARGS_TOKENS else raw_args
+            await _forward_shortcut_to_pane(message, canonical, args)
+            return
+
+    pane_id = _resolve_pane(message.chat_id, message)
+    if not pane_id:
+        _ = await message.reply_text(
+            "No active pane. Use /panes to pick one, or reply to a pane message."
+        )
+        return
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(
+            f"Pane {pane_id} no longer exists. /panes to pick a live one."
+        )
+        return
+    text = message.text
+    if not text:
+        return
+    logger.info("Sending to tmux pane %s: %s", pane_id, text)
+    try:
+        _send_to_tmux(pane_id, text)
+        _ = await message.reply_text(
+            f"→ {pane_id}", reply_to_message_id=message.message_id
+        )
+    except subprocess.CalledProcessError as e:
+        _ = await message.reply_text(f"Failed to send to pane {pane_id}: {e}")
+
+
+# ---------- Entry ----------
+
+_Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Any]
+
+# (command_name, description, handler) — single source of truth for both
+# telegram.ext handler registration and the Telegram UI command menu.
+_COMMANDS: list[tuple[str, str, _Handler]] = [
+    ("panes", "List Claude Code panes (tap to activate)", cmd_panes),
+    ("use", "Set active pane: /use %N", cmd_use),
+    ("which", "Show the active pane", cmd_which),
+    ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
+    ("mute", "Silence hooks: /mute %N", cmd_mute),
+    ("unmute", "Re-enable hooks: /unmute %N", cmd_unmute),
+    ("muted", "List muted panes", cmd_muted),
+    ("history", "Capture pane output: /history %N [lines]", cmd_history),
+    ("shortcut", "Manage Claude shortcuts (add/rm/list)", cmd_shortcut),
+]
+
+
+async def _publish_menu(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
+    """Publish built-in commands + user-defined Claude shortcuts to Telegram.
+
+    Telegram restricts command names to [a-z0-9_]{1,32}, so any shortcut
+    containing hyphens (e.g. ``using-superpowers``) is registered with the
+    hyphens replaced by underscores (``using_superpowers``). The
+    passthrough handler translates back to the canonical name before
+    forwarding to the pane.
+    """
+    menu: list[BotCommand] = [BotCommand(name, desc) for name, desc, _ in _COMMANDS]
+    for name, desc in sorted(state.get_claude_shortcuts().items()):
+        alias = name.replace("-", "_").lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", alias):
+            continue  # silently skip entries that can't be a Telegram bot command
+        label = f"→ Claude /{name}"
+        menu.append(BotCommand(alias, desc if desc else label))
+    await app.bot.set_my_commands(menu)
+
+
+_register_menu = _publish_menu  # back-compat alias kept for existing call sites
 
 
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("panes", panes))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_publish_menu).build()
+    for name, _desc, handler in _COMMANDS:
+        app.add_handler(CommandHandler(name, handler))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    app.add_handler(MessageHandler(filters.COMMAND, on_slash_passthrough))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     logger.info("Bot started, polling...")
     app.run_polling()
 

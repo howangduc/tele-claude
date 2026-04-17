@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 tele-claude = "tele_claude:main"
+tele-claude-format = "tele_claude_format:main"
 
 [dependency-groups]
 dev = [
