@@ -123,10 +123,15 @@ def _call(method: str, data: dict[str, Any]) -> dict[str, Any]:
         body_read = getattr(exc, "read", None)
         if callable(body_read):
             try:
-                err_detail = body_read().decode("utf-8", errors="replace")[:400]
+                raw: bytes = body_read()
+                err_detail = raw.decode("utf-8", errors="replace")[:400]
             except Exception:
                 pass
-        _log_api_error(method, body, err_detail)
+        # "message is not modified" is expected for heartbeat edits when
+        # nothing changed since the last tick — it's a no-op, not a bug.
+        # Skip logging to keep the error log signal-to-noise high.
+        if "message is not modified" not in err_detail:
+            _log_api_error(method, body, err_detail)
         return {"ok": False, "description": err_detail}
 
 
