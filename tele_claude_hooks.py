@@ -306,6 +306,91 @@ def _wait_for_stable_text(
     return prev
 
 
+def _describe_pending_tool_use(transcript_path: Path) -> str | None:
+    """Return an HTML snippet describing the most recent tool_use block.
+
+    Used by the Notification hook so permission prompts tell you WHICH
+    command/file/pattern Claude wants approval for, not just "needs
+    permission to use Bash". Each known tool gets a tuned renderer; the
+    fallback dumps the first few input keys so at least the shape shows.
+    """
+    last: dict[str, Any] | None = None
+    try:
+        with transcript_path.open() as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = entry.get("message") or {}
+                if msg.get("role") != "assistant":
+                    continue
+                for block in msg.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        last = block
+    except OSError:
+        return None
+    if not last:
+        return None
+
+    name = str(last.get("name") or "?")
+    inp = last.get("input") or {}
+    if not isinstance(inp, dict):
+        return f"<b>{html.escape(name)}</b>"
+
+    def esc(s: Any, limit: int = 400) -> str:
+        text = str(s)
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        return html.escape(text, quote=False)
+
+    if name == "Bash":
+        cmd = str(inp.get("command") or "").strip()
+        desc = str(inp.get("description") or "").strip()
+        if cmd:
+            body = f"<pre>$ {esc(cmd, 800)}</pre>"
+            if desc:
+                body += f"\n<i>{esc(desc, 200)}</i>"
+            return body
+        return "<b>Bash</b>"
+    if name == "Write":
+        path = inp.get("file_path") or "?"
+        content = str(inp.get("content") or "")
+        lines = content.count("\n") + (1 if content else 0)
+        return f"📝 <b>Write</b> <code>{esc(path)}</code> ({lines} lines)"
+    if name == "Edit":
+        path = inp.get("file_path") or "?"
+        old = str(inp.get("old_string") or "").splitlines()
+        new = str(inp.get("new_string") or "").splitlines()
+        return (
+            f"✏️ <b>Edit</b> <code>{esc(path)}</code> (−{len(old)} / +{len(new)} lines)"
+        )
+    if name == "Read":
+        path = inp.get("file_path") or "?"
+        return f"📖 <b>Read</b> <code>{esc(path)}</code>"
+    if name == "Glob":
+        pattern = inp.get("pattern") or "?"
+        return f"🔍 <b>Glob</b> <code>{esc(pattern)}</code>"
+    if name == "Grep":
+        pattern = inp.get("pattern") or "?"
+        path = inp.get("path") or ""
+        suffix = f" in <code>{esc(path)}</code>" if path else ""
+        return f"🔍 <b>Grep</b> <code>{esc(pattern)}</code>{suffix}"
+    if name == "Task":
+        subagent = inp.get("subagent_type") or "?"
+        desc = str(inp.get("description") or "").strip()
+        return f"🧑‍💻 <b>Task</b> agent=<code>{esc(subagent)}</code>" + (
+            f"\n<i>{esc(desc, 200)}</i>" if desc else ""
+        )
+    if name == "WebFetch":
+        url = inp.get("url") or "?"
+        return f"🌐 <b>WebFetch</b> <code>{esc(url)}</code>"
+
+    # Unknown tool — show name + first few input keys as shape hint.
+    keys = ", ".join(list(inp.keys())[:3])
+    return f"🛠 <b>{esc(name)}</b>({esc(keys, 120)})"
+
+
 def _last_assistant_text(transcript_path: Path) -> str:
     """Return all assistant text from the most recent turn.
 
@@ -423,6 +508,7 @@ def main_notify() -> None:
     data = _stdin_json()
     notif_type = str(data.get("notification_type") or "unknown")
     msg_text = str(data.get("message") or "").strip()
+    transcript_raw = data.get("transcript_path")
     session_id = str(data.get("session_id") or "unknown")
     cwd = str(data.get("cwd") or "")
     pane_id = os.environ.get("TMUX_PANE", "")
@@ -455,11 +541,21 @@ def main_notify() -> None:
         header_parts.append(f"<code>{html.escape(pane_id)}</code>")
     header = "  ·  ".join(header_parts)
 
-    # Body: the actual notification message (e.g., "Claude needs your
-    # permission to use Bash") on a second line, if provided.
-    text = header
+    # Body: the generic "Claude needs your permission to use X" message
+    # plus a rich description of the pending tool_use (for permission
+    # prompts — idle_prompt rarely has a transcript-worthy target).
+    body_parts: list[str] = []
     if msg_text:
-        text = f"{header}\n{html.escape(msg_text)}"
+        body_parts.append(html.escape(msg_text))
+    if notif_type == "permission_prompt" and transcript_raw:
+        path = Path(str(transcript_raw))
+        if path.exists():
+            detail = _describe_pending_tool_use(path)
+            if detail:
+                body_parts.append(detail)
+    text = header
+    if body_parts:
+        text = header + "\n\n" + "\n\n".join(body_parts)
 
     reply_markup: dict[str, Any] | None = None
     if notif_type == "permission_prompt" and pane_id:
