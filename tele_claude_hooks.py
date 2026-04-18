@@ -175,8 +175,29 @@ def send_message(
     )
     if resp.get("ok"):
         return int(resp["result"]["message_id"])
+    err = str(resp.get("description") or "")
+    # Inline-keyboard button URL rejected? Drop the markup and retry —
+    # the text itself is fine, we just can't attach the bad button.
+    # Examples: local host URLs (localhost, minio), non-FQDN hosts.
+    if reply_markup is not None and (
+        "inline keyboard button URL" in err or "Wrong HTTP URL" in err
+    ):
+        retry = _call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "reply_markup": None,
+                "disable_notification": disable_notification or None,
+            },
+        )
+        if retry.get("ok"):
+            return int(retry["result"]["message_id"])
     # HTML-parse failure? Degrade to plain text so the user still sees
     # the content. Strip tags roughly — enough to rescue the chunk.
+    # Also drop reply_markup in case a bad URL was hiding behind the
+    # parse error (would fail the fallback the same way).
     if parse_mode == "HTML":
         fallback = _strip_html_tags(text)
         resp = _call(
@@ -185,7 +206,7 @@ def send_message(
                 "chat_id": chat_id,
                 "text": f"⚠️ <i>(HTML parse failed, sending as plain)</i>\n\n{fallback}",
                 "parse_mode": None,
-                "reply_markup": reply_markup,
+                "reply_markup": None,
                 "disable_notification": disable_notification or None,
             },
         )
@@ -368,12 +389,52 @@ def _url_label(url: str) -> str:
         return ("Open " + url)[:40]
 
 
+def _is_button_safe_url(url: str) -> bool:
+    """Telegram rejects inline-keyboard URLs that aren't publicly routable.
+
+    Example rejections observed live:
+      http://localhost:4200/api   → "Wrong HTTP URL"
+      http://minio:9000           → "Wrong HTTP URL"
+
+    These local/container-internal hosts slip into Claude's output when
+    it explains docker-compose or dev setups. Attaching them as URL
+    buttons kills the whole sendMessage (the parse-mode fallback also
+    inherits the bad markup, so chunks get silently dropped). Filter
+    here BEFORE building buttons — the URL still appears inline in the
+    text, it just doesn't become a tappable 🔗 button.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.netloc.split("@")[-1].split(":")[0].lower()
+        if not host:
+            return False
+        # Must be a dotted FQDN or dotted IP. Internal container names
+        # (minio, redis, db, …) and "localhost" have no dot and get
+        # dropped here.
+        if "." not in host:
+            return False
+        # Common non-public dot-names also get filtered.
+        blocked = {"localhost", "localhost.localdomain"}
+        if host in blocked:
+            return False
+        if host.startswith("127.") or host == "0.0.0.0":
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _url_buttons(text: str, max_buttons: int = 4) -> list[list[dict[str, Any]]]:
     seen: list[str] = []
     for url in _URL_RE.findall(text):
         url = url.rstrip(".,;:!?)]")
-        if url and url not in seen:
-            seen.append(url)
+        if not url or url in seen:
+            continue
+        if not _is_button_safe_url(url):
+            continue
+        seen.append(url)
         if len(seen) >= max_buttons:
             break
     return [[{"text": f"🔗 {_url_label(u)}", "url": u}] for u in seen]
