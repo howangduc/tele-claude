@@ -59,10 +59,14 @@ _IDLE_SUPPRESS_SECONDS = float(os.environ.get("TELE_CLAUDE_IDLE_MIN_SECONDS", "9
 
 # Typing-indicator pumper: sendChatAction lasts 5 s per call, so the pumper
 # re-sends every _TYPING_PUMP_INTERVAL seconds while a turn is active.
-# Capped at _TYPING_PUMP_MAX_SECONDS so an orphaned progress file (Stop hook
-# failed to clear) doesn't leave the pumper running forever.
+# _TYPING_PUMP_MAX_SECONDS is an absolute wall-clock ceiling (protects
+# against truly-orphaned pumpers), but the pumper also exits early as
+# soon as the progress file disappears. Raised from 10 min → 45 min
+# because long Agent-Team / Task fan-out turns can legitimately run
+# longer than 10 min and users were watching the typing indicator go
+# dead on healthy long turns.
 _TYPING_PUMP_INTERVAL = 4.0
-_TYPING_PUMP_MAX_SECONDS = 600.0
+_TYPING_PUMP_MAX_SECONDS = 2700.0  # 45 min
 
 
 # ---------- HTTP ----------
