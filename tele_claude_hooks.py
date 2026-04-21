@@ -1205,6 +1205,17 @@ def main_post_tool_use() -> None:
     tool_count, last_tool, latest_text, running_subagents = _summarise_in_progress(
         transcript_path
     )
+
+    # Surface live status in the tmux pane title so /panes (and tmux
+    # borders if the user enables pane-border-status) shows "⏳ 7t · Bash +2a"
+    # instead of a generic working-directory label.
+    title_bits: list[str] = [f"⏳ {tool_count}t"]
+    if last_tool:
+        title_bits.append(f"· {last_tool}")
+    if running_subagents:
+        title_bits.append(f"+{len(running_subagents)}a")
+    _set_pane_title(pane_id, " ".join(title_bits))
+
     header = _build_header(cwd, pane_id, "⏳")
 
     # Body: tool counter + in-flight subagent list + optional text preview.
@@ -1291,6 +1302,17 @@ def main_subagent_stop() -> None:
     tool_count, last_tool, latest_text, running_subagents = _summarise_in_progress(
         transcript_path
     )
+
+    # Surface live status in the tmux pane title so /panes (and tmux
+    # borders if the user enables pane-border-status) shows "⏳ 7t · Bash +2a"
+    # instead of a generic working-directory label.
+    title_bits: list[str] = [f"⏳ {tool_count}t"]
+    if last_tool:
+        title_bits.append(f"· {last_tool}")
+    if running_subagents:
+        title_bits.append(f"+{len(running_subagents)}a")
+    _set_pane_title(pane_id, " ".join(title_bits))
+
     header = _build_header(cwd, pane_id, "⏳")
     summary = (
         f"<i>Working… {tool_count} tool call{'' if tool_count == 1 else 's'}"
