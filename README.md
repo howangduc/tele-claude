@@ -135,7 +135,7 @@ If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its ab
 
 | Command | What it does |
 |---------|--------------|
-| `/panes` | Lists Claude Code panes as tappable buttons. Tapping a button sets the **active pane**. Muted panes show a 🔕 badge; the active pane shows ●. |
+| `/panes` | Lists Claude Code panes as tappable buttons. Tapping a button sets the **active pane**. Each button's label shows the pane's current **tmux pane-title** — set automatically by our hooks to reflect live activity (`⏳ 7t · Bash +2a`, `🔐 Edit`, `🤖 Found 3 issues`, `💤 idle`) — so you can tell at a glance which pane is doing what without opening each. Muted panes show a 🔕 badge; the active pane shows ●. |
 | `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
 | `/which` | Shows the current active pane. |
 | `/pwd [%N]` | Shows the pane's live working directory (`pane_current_path`) as a tap-to-copy code block. Falls back to active pane if omitted. |
@@ -170,6 +170,28 @@ Badges in `/panes`:
 - `🔔` subscribed, not active
 - `🔕` subscribed, muted
 - `·` alive but not subscribed (tap to opt in)
+
+### Pane titles — live activity labels
+
+Each hook fires a `tmux select-pane -T <title>` with a concise status summary so every pane gets a live, human-readable label:
+
+| Event | Title format | Example |
+|-------|--------------|---------|
+| `UserPromptSubmit` | `⏳ <prompt preview 40c>` | `⏳ fix the auth race condition` |
+| `PostToolUse` | `⏳ Nt · <last_tool>[ +Ka]` | `⏳ 7t · Bash +2a` (7 tools, last=Bash, 2 subagents running) |
+| `SubagentStop` | refreshed same as PostToolUse | `⏳ 7t · Task +1a` |
+| `Notification: permission_prompt` | `🔐 <ToolName>` | `🔐 Edit` |
+| `Notification: idle_prompt` | `💤 idle` | `💤 idle` |
+| `Stop` | `🤖 <first line of reply 40c>` | `🤖 Found 3 issues — shipping fix` |
+
+These titles show up automatically in `/panes` button labels on Telegram. For visibility **inside tmux itself** (on pane borders), optionally add to `~/.tmux.conf`:
+
+```tmux
+set -g pane-border-status top
+set -g pane-border-format " #{pane_id}  #{pane_title} "
+```
+
+Reload with `tmux source ~/.tmux.conf` or restart tmux. Not required — Telegram `/panes` shows the titles regardless.
 
 > 💡 **Command menu.** The bot publishes this list to Telegram via `setMyCommands` on startup. Tap the **☰ Menu** button in the chat (or type `/`) to see all commands with descriptions and pick one by tap.
 
