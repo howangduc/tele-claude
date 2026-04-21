@@ -110,25 +110,37 @@ def _normalise_pane(raw: str) -> str:
     return raw if raw.startswith("%") else f"%{raw.lstrip('%')}"
 
 
-def _list_claude_panes() -> list[tuple[str, str]]:
+def _list_claude_panes() -> list[tuple[str, str, str]]:
+    """Return (pane_id, cwd, title) for every Claude-running pane.
+
+    Title comes from tmux's pane_title attribute — our hooks update
+    it on every prompt / tool call / reply so /panes can show what
+    each pane is actually doing, not just the working directory.
+    """
     result = subprocess.run(
         [
             "tmux",
             "list-panes",
             "-a",
+            # Tab-separated so paths/titles with spaces stay intact.
             "-F",
-            "#{pane_id} #{pane_current_path}",
+            "#{pane_id}\t#{pane_current_path}\t#{pane_title}",
             "-f",
             "#{m:*claude*,#{pane_current_command}}",
         ],
         capture_output=True,
         text=True,
     )
-    panes: list[tuple[str, str]] = []
+    panes: list[tuple[str, str, str]] = []
     for line in result.stdout.strip().splitlines():
-        if line:
-            pane_id, _, path = line.partition(" ")
-            panes.append((pane_id, path))
+        if not line:
+            continue
+        parts = line.split("\t")
+        pane_id = parts[0] if len(parts) > 0 else ""
+        path = parts[1] if len(parts) > 1 else ""
+        title = parts[2] if len(parts) > 2 else ""
+        if pane_id:
+            panes.append((pane_id, path, title))
     return panes
 
 
@@ -198,7 +210,7 @@ async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     if not message or not _authorised(message.chat_id):
         return
     panes = _list_claude_panes()
-    alive_ids = {p for p, _ in panes}
+    alive_ids = {p for p, _, _ in panes}
     # Purge any state pointing at panes that no longer exist so the UI
     # never shows stale %IDs (active/subscribed/muted all get cleaned).
     _ = state.prune_panes(alive_ids)
@@ -209,7 +221,7 @@ async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     subscribed = state.get_subscribed_panes()
     muted = state.get_muted_panes()
     rows: list[list[InlineKeyboardButton]] = []
-    for pane_id, path in panes:
+    for pane_id, path, title in panes:
         if pane_id == active:
             badge = "● "
         elif pane_id in muted:
@@ -218,7 +230,16 @@ async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
             badge = "🔔 "
         else:
             badge = "· "  # unsubscribed — no forwarding yet
-        label = f"{badge}{pane_id}  {_short_home(path)}"
+        # Title set by our hooks wins the button label — it tells the user
+        # what the pane is doing. Falls back to working dir for panes
+        # whose hooks haven't fired yet (fresh /new, or untouched panes).
+        # Telegram inline-button labels have a practical limit ~64 chars.
+        label_body = (
+            title
+            if title and not title.startswith(os.path.basename(path.rstrip("/")))
+            else _short_home(path)
+        )
+        label = f"{badge}{pane_id}  {label_body}"[:60]
         rows.append([InlineKeyboardButton(label, callback_data=f"use:{pane_id}")])
     subs_summary = (
         f"{len(subscribed & alive_ids)}/{len(alive_ids)} subscribed"

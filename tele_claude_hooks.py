@@ -279,6 +279,30 @@ def _project(cwd: str) -> str:
     return os.path.basename(cwd.rstrip("/")) if cwd else ""
 
 
+def _set_pane_title(pane_id: str, title: str) -> None:
+    """Set a tmux pane's title so `/panes` (and tmux borders, if enabled)
+    show what Claude is actually doing instead of just the working dir.
+
+    Silent best-effort: tmux unavailable, pane gone, whitespace-only
+    title, etc. all just fall through without raising. Newlines
+    flattened to spaces (tmux titles are single-line) and capped at
+    60 chars so they fit status lines without truncation.
+    """
+    if not pane_id or not title:
+        return
+    clean = title.replace("\n", " ").replace("\r", " ").strip()[:60]
+    if not clean:
+        return
+    try:
+        _ = subprocess.run(
+            ["tmux", "select-pane", "-t", pane_id, "-T", clean],
+            check=False,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
 def _build_header(cwd: str, pane_id: str, emoji: str) -> str:
     parts = [emoji]
     project = _project(cwd)
@@ -838,6 +862,16 @@ def main_reply() -> None:
     if not raw_md:
         return
 
+    # First line of the reply as pane title — shows what Claude
+    # finished with so users can tell idle panes apart in /panes.
+    first_line = raw_md.strip().splitlines()[0] if raw_md.strip() else ""
+    if first_line:
+        # Strip markdown heading/formatting chars for a cleaner title.
+        cleaned = (
+            first_line.lstrip("# *_-").strip().replace("*", "").replace("`", "")[:40]
+        )
+        _set_pane_title(pane_id, f"🤖 {cleaned}" if cleaned else "🤖 done")
+
     # Dedup: skip if the same body was sent within the TTL.
     if state.check_and_set_fingerprint(session_id, raw_md):
         return
@@ -963,6 +997,12 @@ def main_notify() -> None:
     reply_markup: dict[str, Any] | None = None
     if notif_type == "permission_prompt":
         reply_markup = _build_permission_keyboard(pane_id, pending_tool)
+        tool_name = (
+            str(pending_tool.get("name")) if pending_tool else ""
+        ) or "permission"
+        _set_pane_title(pane_id, f"🔐 {tool_name}")
+    elif notif_type == "idle_prompt":
+        _set_pane_title(pane_id, "💤 idle")
 
     for chat_id in _chat_ids():
         send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
@@ -1005,6 +1045,12 @@ def main_progress() -> None:
         return
     if pane_id and state.is_muted(pane_id):
         return
+
+    # Surface the prompt in the tmux pane title so the user can see at a
+    # glance what each of their panes is working on (visible in /panes
+    # listing and on pane borders if pane-border-status is enabled).
+    preview_title = prompt.strip().replace("\n", " ")[:40]
+    _set_pane_title(pane_id, f"⏳ {preview_title}" if preview_title else "⏳ working")
 
     header = _build_header(cwd, pane_id, "⏳")
     preview = prompt.strip()
