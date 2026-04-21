@@ -284,8 +284,10 @@ async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
     """Shared spawn logic used by both ``cmd_new`` and the ForceReply path."""
+    logger.info("cmd_new: spawning new pane, cwd_arg=%r", cwd_arg)
     cwd = os.path.expanduser(cwd_arg) if cwd_arg else os.path.expanduser("~")
     if not os.path.isdir(cwd):
+        logger.info("cmd_new: directory not found: %s", cwd)
         _ = await message.reply_text(
             f"Directory not found: <code>{_html.escape(cwd)}</code>",
             parse_mode="HTML",
@@ -313,6 +315,7 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
     )
     session = attached_name or session_list[0]
 
+    logger.info("cmd_new: creating window in session=%r cwd=%s", session, cwd)
     try:
         created = subprocess.run(
             [
@@ -331,12 +334,15 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
             check=True,
         )
     except subprocess.CalledProcessError as e:
+        logger.exception("cmd_new: tmux new-window failed")
         _ = await message.reply_text(f"Failed to create pane: {e.stderr or e}")
         return
     new_pane = created.stdout.strip()
     if not new_pane:
+        logger.error("cmd_new: tmux returned empty pane id")
         _ = await message.reply_text("tmux didn't return a pane id.")
         return
+    logger.info("cmd_new: created pane %s, launching cc", new_pane)
 
     time.sleep(0.4)
     _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "cc", "Enter"], check=True)
@@ -370,9 +376,11 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not _authorised(message.chat_id):
         return
     args = list(context.args or [])
+    logger.info("cmd_new invoked, args=%r", args)
     if args:
         await _spawn_new_pane(message, args[0])
         return
+    logger.info("cmd_new: bare invocation, sending ForceReply prompt")
     _ = await message.reply_text(
         f"{_ARGS_PROMPT_PREFIX}new?\n\n"
         "Reply with a directory (e.g. <code>~/Source/foo</code>) or "
