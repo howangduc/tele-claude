@@ -261,26 +261,13 @@ async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Spawn a new tmux window running Claude, auto-subscribe + activate.
-
-    Usage: /new [dir]
-        no arg   → start in $HOME
-        "/new ~/Source/foo"  → start in that directory
-
-    Runs `cc` so the user's existing alias chain kicks in (TELE_CLAUDE=1
-    via the `claude` alias + `--dangerously-skip-permissions` via `cc`).
-    Falls back to `claude --dangerously-skip-permissions` if `cc` isn't
-    defined in the spawned shell.
-    """
-    message = update.message
-    if not message or not _authorised(message.chat_id):
-        return
-    args = list(context.args or [])
-    cwd = os.path.expanduser(args[0]) if args else os.path.expanduser("~")
+async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
+    """Shared spawn logic used by both ``cmd_new`` and the ForceReply path."""
+    cwd = os.path.expanduser(cwd_arg) if cwd_arg else os.path.expanduser("~")
     if not os.path.isdir(cwd):
         _ = await message.reply_text(
-            f"Directory not found: <code>{_html.escape(cwd)}</code>", parse_mode="HTML"
+            f"Directory not found: <code>{_html.escape(cwd)}</code>",
+            parse_mode="HTML",
         )
         return
 
@@ -295,7 +282,6 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "No tmux session found. Start tmux on the host first."
         )
         return
-    # Prefer the attached session if there is one, else first in the list.
     attached = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{?session_attached,#{session_name},}"],
         capture_output=True,
@@ -306,7 +292,6 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     session = attached_name or session_list[0]
 
-    # Create new window; -P prints the new pane id.
     try:
         created = subprocess.run(
             [
@@ -332,12 +317,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _ = await message.reply_text("tmux didn't return a pane id.")
         return
 
-    # Short pause so bashrc (and the `cc` / `claude` aliases) load before
-    # we send the launch command. Without it, the shell may not yet know
-    # `cc` and the send-keys lands as an unknown command.
     time.sleep(0.4)
-    # Send `cc` — relies on user's cc alias (=claude --dangerously-skip-permissions).
-    # If the shell doesn't have it, user can correct it in-pane.
     _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "cc", "Enter"], check=True)
 
     state.subscribe_pane(new_pane)
@@ -350,6 +330,37 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<code>{_html.escape(session)}</code>\n"
         f"Launched <code>cc</code> · active + subscribed 🔔",
         parse_mode="HTML",
+    )
+
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Spawn a new Claude pane. With args: spawn immediately. Bare: ForceReply.
+
+    Usage:
+      /new             → ForceReply prompt (misclick-safe from ☰ menu)
+      /new ~/foo       → spawn directly in that directory
+      /new /abs        → absolute paths accepted
+
+    The bare-invocation path prompts because tapping /new from Telegram's
+    ☰ Menu fires it with no args — silent-spawning in $HOME on a misclick
+    is the wrong default. Matches the Claude-shortcut ForceReply UX.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    if args:
+        await _spawn_new_pane(message, args[0])
+        return
+    _ = await message.reply_text(
+        f"{_ARGS_PROMPT_PREFIX}new?\n\n"
+        "Reply with a directory (e.g. <code>~/Source/foo</code>) or "
+        "<code>.</code> to use <code>$HOME</code>.",
+        parse_mode="HTML",
+        reply_markup=ForceReply(
+            input_field_placeholder="dir (or . for $HOME)",
+            selective=True,
+        ),
     )
 
 
@@ -793,9 +804,10 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
     if not message or not _authorised(message.chat_id):
         return
 
-    # If this is a reply to one of our "Args for /cmd?" prompts, extract the
-    # canonical command and forward. Users can send "." (or similar tokens) to
-    # forward the command bare instead of with arguments.
+    # If this is a reply to one of our "Args for /cmd?" prompts, dispatch.
+    # Built-in commands (like /new) route to their handler; Claude shortcuts
+    # forward /cmd <args> to the active pane. Skip tokens (".", "-", "skip",
+    # "go", "bare", empty) mean "no args / accept default".
     reply_to = message.reply_to_message
     if reply_to and reply_to.text and reply_to.text.startswith(_ARGS_PROMPT_PREFIX):
         header = reply_to.text[len(_ARGS_PROMPT_PREFIX) :]
@@ -803,6 +815,9 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
         if canonical:
             raw_args = (message.text or "").strip()
             args = "" if raw_args.lower() in _SKIP_ARGS_TOKENS else raw_args
+            if canonical == "new":
+                await _spawn_new_pane(message, args)
+                return
             await _forward_shortcut_to_pane(message, canonical, args)
             return
 
