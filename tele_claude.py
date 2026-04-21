@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -140,7 +141,28 @@ def _pane_exists(pane_id: str) -> bool:
 
 
 def _send_to_tmux(pane_id: str, text: str) -> None:
-    _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
+    # Multi-line text lands in Claude Code's TUI as a collapsed
+    # `[Pasted text #N +M lines]` token. If we hit Enter too quickly
+    # after the paste, the REPL hasn't yet registered the paste as a
+    # finished token and the Enter gets swallowed — the prompt stays
+    # on screen but never submits. A short pause lets the REPL settle.
+    # Also route multi-line via tmux load-buffer / paste-buffer so the
+    # REPL treats it as a genuine paste (triggers the collapse path)
+    # rather than as rapid-fire keystrokes.
+    if "\n" in text:
+        _ = subprocess.run(
+            ["tmux", "load-buffer", "-b", "tele-claude-tmp", "-"],
+            input=text,
+            text=True,
+            check=True,
+        )
+        _ = subprocess.run(
+            ["tmux", "paste-buffer", "-b", "tele-claude-tmp", "-t", pane_id, "-d"],
+            check=True,
+        )
+        time.sleep(0.3)
+    else:
+        _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
     # Any successful send-via-bot is an implicit subscribe — the user has
     # clearly opted this pane into the Telegram conversation loop.
