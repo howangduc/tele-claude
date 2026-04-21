@@ -77,6 +77,7 @@ _BUILTIN_COMMANDS = {
     "use",
     "which",
     "pwd",
+    "new",
     "cancel",
     "mute",
     "unmute",
@@ -257,6 +258,98 @@ async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     current = state.get_active_pane(message.chat_id)
     _ = await message.reply_text(
         f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
+    )
+
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Spawn a new tmux window running Claude, auto-subscribe + activate.
+
+    Usage: /new [dir]
+        no arg   → start in $HOME
+        "/new ~/Source/foo"  → start in that directory
+
+    Runs `cc` so the user's existing alias chain kicks in (TELE_CLAUDE=1
+    via the `claude` alias + `--dangerously-skip-permissions` via `cc`).
+    Falls back to `claude --dangerously-skip-permissions` if `cc` isn't
+    defined in the spawned shell.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    cwd = os.path.expanduser(args[0]) if args else os.path.expanduser("~")
+    if not os.path.isdir(cwd):
+        _ = await message.reply_text(
+            f"Directory not found: <code>{_html.escape(cwd)}</code>", parse_mode="HTML"
+        )
+        return
+
+    sessions = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+    )
+    session_list = [s for s in sessions.stdout.strip().splitlines() if s]
+    if not session_list:
+        _ = await message.reply_text(
+            "No tmux session found. Start tmux on the host first."
+        )
+        return
+    # Prefer the attached session if there is one, else first in the list.
+    attached = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{?session_attached,#{session_name},}"],
+        capture_output=True,
+        text=True,
+    )
+    attached_name = next(
+        (line for line in attached.stdout.strip().splitlines() if line), ""
+    )
+    session = attached_name or session_list[0]
+
+    # Create new window; -P prints the new pane id.
+    try:
+        created = subprocess.run(
+            [
+                "tmux",
+                "new-window",
+                "-t",
+                f"{session}:",
+                "-c",
+                cwd,
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _ = await message.reply_text(f"Failed to create pane: {e.stderr or e}")
+        return
+    new_pane = created.stdout.strip()
+    if not new_pane:
+        _ = await message.reply_text("tmux didn't return a pane id.")
+        return
+
+    # Short pause so bashrc (and the `cc` / `claude` aliases) load before
+    # we send the launch command. Without it, the shell may not yet know
+    # `cc` and the send-keys lands as an unknown command.
+    time.sleep(0.4)
+    # Send `cc` — relies on user's cc alias (=claude --dangerously-skip-permissions).
+    # If the shell doesn't have it, user can correct it in-pane.
+    _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "cc", "Enter"], check=True)
+
+    state.subscribe_pane(new_pane)
+    state.set_active_pane(message.chat_id, new_pane)
+
+    short_cwd = cwd.replace(os.path.expanduser("~"), "~")
+    _ = await message.reply_text(
+        f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
+        f"<code>{_html.escape(short_cwd)}</code> · session "
+        f"<code>{_html.escape(session)}</code>\n"
+        f"Launched <code>cc</code> · active + subscribed 🔔",
+        parse_mode="HTML",
     )
 
 
@@ -748,6 +841,7 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("use", "Set active pane: /use %N", cmd_use),
     ("which", "Show the active pane", cmd_which),
     ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
+    ("new", "Spawn a new Claude pane: /new [dir]", cmd_new),
     ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
     ("mute", "Silence hooks: /mute %N", cmd_mute),
     ("unmute", "Re-enable hooks: /unmute %N", cmd_unmute),
