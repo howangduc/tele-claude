@@ -139,6 +139,7 @@ If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its ab
 | `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
 | `/which` | Shows the current active pane. |
 | `/pwd [%N]` | Shows the pane's live working directory (`pane_current_path`) as a tap-to-copy code block. Falls back to active pane if omitted. |
+| `/new [dir]` | Spawn a fresh Claude pane in a new tmux window (defaults to `$HOME`; accepts `~/foo` or absolute paths). Launches `cc` in that shell (user's alias = `claude --dangerously-skip-permissions`), auto-subscribes the pane, and makes it the active pane — the next message you send goes there without `/use`. |
 | `/cancel [%N]` | Sends **Ctrl-C** to a pane (active pane if `%N` omitted). Stops a runaway turn from your phone. |
 | `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane (still subscribed). |
 | `/unmute %N` | Resumes forwarding. |
