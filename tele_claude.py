@@ -1,23 +1,34 @@
 """Telegram bot that forwards messages to Claude Code tmux panes.
 
-Features
-  /panes          — tappable keyboard of Claude Code panes; tap to activate.
-  /use %N         — set active pane without the picker.
-  /which          — show the active pane.
-  /cancel [%N]    — send Ctrl-C to a pane (active if omitted).
-  /mute %N        — silence Notification + Stop hooks for that pane.
-  /unmute %N      — re-enable hooks.
-  /muted          — list muted panes.
-  /history %N [n] — capture and send the last N lines of a pane.
+Commands (single source of truth is ``_COMMANDS`` near the bottom):
+  /panes             — tappable keyboard of Claude Code panes; tap to activate.
+  /use %N            — set active pane without the picker.
+  /which             — show the active pane.
+  /pwd [%N]          — show pane's live working directory.
+  /new [dir]         — spawn a fresh detached tmux session running cc; bare invocation prompts via ForceReply.
+  /cancel [%N]       — send Ctrl-C to a pane (active if omitted).
+  /mute %N           — silence Notification + Stop hooks for that pane.
+  /unmute %N         — re-enable hooks.
+  /muted             — list muted panes.
+  /subscribe %N      — opt a pane into hook forwarding.
+  /unsubscribe %N    — remove a pane from forwarding.
+  /subscribed        — list subscribed panes.
+  /history %N [n]    — capture and send the last N lines of a pane.
+  /shortcut add|rm|list — manage user-defined Claude slash-command shortcuts.
 
 Callback handlers (from inline keyboards placed by hooks or by /panes):
   use:%N          — activate a pane.
-  ans:%N:1|2|3    — send a digit to a pane (permission prompt answers).
+  ans:%N:1|2|3    — send a digit to a pane (permission prompt answers, single-select AskUserQuestion).
+  mtg:%N:idx:mask — toggle an option in a multi-select AskUserQuestion (digit keystroke flips TUI checkbox).
+  msub:%N         — advance a multi-select AskUserQuestion to Claude's review screen (Enter), then swap keyboard for final confirm/cancel.
+  mfin:%N:1|2     — final step of multi-select: 1=Submit answers, 2=Cancel (digit + Enter on the TUI's review prompt).
   qr:%N:<text>    — quick-reply text to a pane.
   cancel:%N       — send Ctrl-C to a pane.
 
 Fallback for plain-text messages: resolve pane from a reply-to `%N`,
-otherwise the active pane for that chat.
+otherwise the active pane for that chat. Replies to "Args for /cmd?"
+ForceReply prompts are dispatched back through the matching handler
+(either a built-in like /new or a shortcut forward).
 """
 
 from __future__ import annotations
@@ -67,6 +78,31 @@ IMAGE_DIR = Path(
     os.environ.get("TELE_CLAUDE_IMAGE_DIR")
     or str(Path.home() / ".cache" / "tele-claude" / "images")
 )
+
+
+# Forum mode: when set, the bot runs inside a supergroup that has Topics
+# enabled, and each Claude pane gets its own topic (forum thread). Value
+# is the supergroup id (negative int, e.g. -1001234567890). Unset → bot
+# runs in legacy single-thread mode (private chat or plain group) and
+# every topic-related code path short-circuits.
+def _read_forum_chat_id() -> int | None:
+    raw = os.environ.get("TELE_CLAUDE_SUPERGROUP_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+_FORUM_CHAT_ID: int | None = _read_forum_chat_id()
+
+# Telegram caps forum-topic names at 128 chars; we stay well under it.
+_TOPIC_NAME_MAX = 120
+
+# Width budget for the `cwd` segment of the topic name before we start
+# ellipsising it. Leaves room for pane id, title, and two separators.
+_TOPIC_CWD_MAX = 60
 
 _PANE_RE = re.compile(r"(?<!\w)%\d+(?!\w)")
 
@@ -187,7 +223,40 @@ def _send_key(pane_id: str, key: str) -> None:
     state.subscribe_pane(pane_id)
 
 
+def _pane_from_thread(message: Message) -> str | None:
+    """Return the pane that owns the topic this message was posted in.
+
+    Only non-None in forum mode when the message landed inside a
+    pane-mapped topic. Shared helper so commands and plain-text
+    handlers route consistently.
+    """
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is None:
+        return None
+    return state.get_pane_by_thread(int(thread_id))
+
+
+def _pane_context(message: Message) -> str | None:
+    """Resolve the pane context of an *inbound* command with no explicit %N.
+
+    Order: topic (forum mode) → per-chat active pane. Used by bare-arg
+    commands like ``/pwd``, ``/cancel``, ``/which`` — the topic you're
+    viewing IS the active pane in forum mode, even though ``chat_id``
+    is the supergroup's (shared across every topic).
+    """
+    pane = _pane_from_thread(message)
+    if pane:
+        return pane
+    return state.get_active_pane(message.chat_id)
+
+
 def _resolve_pane(chat_id: int, message: Message) -> str | None:
+    # Forum mode wins: if this message was posted inside a topic that maps
+    # to a pane, that's the intended destination — no /use, no reply-to
+    # dance. The topic the user is viewing IS the active pane.
+    pane = _pane_from_thread(message)
+    if pane:
+        return pane
     reply_to = message.reply_to_message
     if reply_to and reply_to.text:
         match = _PANE_RE.search(reply_to.text)
@@ -196,24 +265,173 @@ def _resolve_pane(chat_id: int, message: Message) -> str | None:
     return state.get_active_pane(chat_id)
 
 
-def _pane_arg_or_active(chat_id: int, args: list[str]) -> str | None:
+# ---------- Forum-mode helpers ----------
+
+
+def _forum_enabled() -> bool:
+    return _FORUM_CHAT_ID is not None
+
+
+def _truncate_middle(text: str, max_len: int) -> str:
+    """Shrink ``text`` to ``max_len`` by dropping characters from the middle."""
+    if len(text) <= max_len:
+        return text
+    if max_len < 3:
+        return text[:max_len]
+    keep = max_len - 1  # room for the ellipsis
+    head = keep // 2
+    tail = keep - head
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def _compose_topic_name(pane_id: str, pane_title: str, cwd: str) -> str:
+    """Build ``%N · <title> · <full cwd>`` capped to Telegram's 128-char
+    topic-name limit. Full cwd is preserved verbatim unless it would
+    overflow, in which case the middle is ellipsised.
+    """
+    title_part = pane_title.strip()
+    if len(title_part) > 40:
+        title_part = title_part[:37] + "…"
+    cwd_part = _truncate_middle(cwd, _TOPIC_CWD_MAX)
+    segments = [pane_id]
+    if title_part:
+        segments.append(title_part)
+    if cwd_part:
+        segments.append(cwd_part)
+    name = " · ".join(segments)
+    if len(name) > _TOPIC_NAME_MAX:
+        name = name[: _TOPIC_NAME_MAX - 1] + "…"
+    return name
+
+
+def _pane_info(pane_id: str) -> tuple[str, str]:
+    """Return ``(pane_title, cwd)`` for a live pane — empty strings if dead."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_title}\t#{pane_current_path}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    out = result.stdout.strip()
+    if not out:
+        return "", ""
+    parts = out.split("\t", 1)
+    title = parts[0] if parts else ""
+    cwd = parts[1] if len(parts) > 1 else ""
+    return title, cwd
+
+
+async def _ensure_topic_for_pane(
+    app: Application[Any, Any, Any, Any, Any, Any],
+    pane_id: str,
+    pane_title: str = "",
+    cwd: str = "",
+) -> int | None:
+    """Return the thread_id for ``pane_id``'s topic, creating it if needed.
+
+    Short-circuits to ``None`` when forum mode is disabled so callers can
+    pass the result straight through to ``message_thread_id=…`` and get
+    legacy single-thread behavior for free.
+
+    On missing topic metadata (fresh pane, no hook has fired yet), we
+    probe tmux for live ``pane_title`` + ``pane_current_path`` so the
+    first-seen name is already informative instead of ``%15 ·  ·``.
+    """
+    if not _forum_enabled() or _FORUM_CHAT_ID is None:
+        return None
+    existing = state.get_topic(pane_id)
+    if existing is not None:
+        return existing
+    if not pane_title or not cwd:
+        probe_title, probe_cwd = _pane_info(pane_id)
+        pane_title = pane_title or probe_title
+        cwd = cwd or probe_cwd
+    name = _compose_topic_name(pane_id, pane_title, cwd)
+    try:
+        topic = await app.bot.create_forum_topic(chat_id=_FORUM_CHAT_ID, name=name)
+    except Exception:
+        logger.exception("createForumTopic failed for %s", pane_id)
+        return None
+    thread_id = int(topic.message_thread_id)
+    state.set_topic(pane_id, thread_id)
+    state.set_cached_topic_name(pane_id, name)
+    logger.info("Created topic for %s: thread_id=%d name=%r", pane_id, thread_id, name)
+    return thread_id
+
+
+async def _delete_topic_for_pane(
+    app: Application[Any, Any, Any, Any, Any, Any], pane_id: str, thread_id: int
+) -> None:
+    if not _forum_enabled() or _FORUM_CHAT_ID is None:
+        return
+    try:
+        _ = await app.bot.delete_forum_topic(
+            chat_id=_FORUM_CHAT_ID, message_thread_id=thread_id
+        )
+        logger.info("Deleted topic for %s (thread_id=%d)", pane_id, thread_id)
+    except Exception:
+        # Ignore — user may have deleted it manually, or permissions
+        # missing. The state side is already cleaned up by prune_panes.
+        logger.exception(
+            "deleteForumTopic failed for %s (thread_id=%d)", pane_id, thread_id
+        )
+
+
+def _pane_arg_or_active(message: Message, args: list[str]) -> str | None:
+    """Resolve target pane for a command: explicit %N arg wins, else context.
+
+    Context = forum topic if the message came from one, else the chat's
+    active pane. Makes bare ``/pwd``, ``/cancel``, etc. work correctly
+    in a supergroup — in single-thread mode the topic branch is a no-op
+    and behavior matches what it always was.
+    """
     if args:
         return _normalise_pane(args[0])
-    return state.get_active_pane(chat_id)
+    return _pane_context(message)
 
 
 # ---------- Commands ----------
 
 
-async def cmd_panes(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_panes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
     panes = _list_claude_panes()
     alive_ids = {p for p, _, _ in panes}
+    # Forum-mode reconciliation: BEFORE prune_panes wipes topic state,
+    # snapshot (pane_id, thread_id) for every now-dead pane so we can
+    # issue deleteForumTopic on the Telegram side too. Skipped when
+    # forum mode is off — get_all_topics returns {} so the set stays
+    # empty and nothing happens.
+    dead_topic_targets: list[tuple[str, int]] = []
+    if _forum_enabled():
+        dead_topic_targets = [
+            (pane, tid)
+            for pane, tid in state.get_all_topics().items()
+            if pane not in alive_ids
+        ]
     # Purge any state pointing at panes that no longer exist so the UI
-    # never shows stale %IDs (active/subscribed/muted all get cleaned).
+    # never shows stale %IDs (active/subscribed/muted/topics all get
+    # cleaned in one atomic save).
     _ = state.prune_panes(alive_ids)
+    for pane_id, thread_id in dead_topic_targets:
+        await _delete_topic_for_pane(context.application, pane_id, thread_id)
+    # Create topics for any live pane that doesn't have one yet — makes
+    # /panes a full-reconcile command in both directions. No-op when
+    # forum mode is off.
+    if _forum_enabled():
+        for pane_id, path, title in panes:
+            if state.get_topic(pane_id) is None:
+                _ = await _ensure_topic_for_pane(
+                    context.application, pane_id, pane_title=title, cwd=path
+                )
     if not panes:
         _ = await message.reply_text("No Claude Code panes found.")
         return
@@ -261,7 +479,9 @@ async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = list(context.args or [])
     if not args:
-        current = state.get_active_pane(message.chat_id)
+        # Bare /use = "what's active?". In a topic, that's the topic's
+        # pane; outside, the per-chat active pane.
+        current = _pane_context(message)
         _ = await message.reply_text(
             f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
         )
@@ -276,15 +496,56 @@ async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
+    # In a forum topic, "which pane?" = the pane that owns this topic.
+    # Outside a topic, fall back to the per-chat active pane.
+    topic_pane = _pane_from_thread(message)
+    if topic_pane:
+        _ = await message.reply_text(f"Active: {topic_pane} (from this topic)")
+        return
     current = state.get_active_pane(message.chat_id)
     _ = await message.reply_text(
         f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
     )
 
 
+def _pick_session_name(cwd: str) -> str:
+    """Derive a unique tmux session name from the cwd basename.
+
+    Collision handling: if ``claude-<basename>`` is taken, try ``-2``,
+    ``-3``, … until we find a free one. tmux session names allow most
+    characters but we scrub anything not in ``[\\w-]`` to keep names
+    shell- and tmux-friendly (tmux uses ``:`` and ``.`` as separators).
+    """
+    base = os.path.basename(cwd.rstrip("/")) or "home"
+    safe = re.sub(r"[^\w-]", "-", base).strip("-") or "home"
+    existing = {
+        line
+        for line in subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        if line
+    }
+    candidate = f"claude-{safe}"
+    i = 2
+    while candidate in existing:
+        candidate = f"claude-{safe}-{i}"
+        i += 1
+    return candidate
+
+
 async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
-    """Shared spawn logic used by both ``cmd_new`` and the ForceReply path."""
-    logger.info("cmd_new: spawning new pane, cwd_arg=%r", cwd_arg)
+    """Spawn a fresh detached tmux session running ``cc`` and subscribe it.
+
+    Each ``/new`` gets its own session (not just a window) so concurrent
+    Claude tasks stay isolated — independent scrollback, single
+    ``tmux kill-session`` cleanup, and no yanking the user's current
+    client to a new window. The new session is detached so the user's
+    attached terminal keeps doing whatever it was doing; they
+    ``tmux attach -t <name>`` when they want to see it directly.
+    """
+    logger.info("cmd_new: spawning new session, cwd_arg=%r", cwd_arg)
     cwd = os.path.expanduser(cwd_arg) if cwd_arg else os.path.expanduser("~")
     if not os.path.isdir(cwd):
         logger.info("cmd_new: directory not found: %s", cwd)
@@ -294,35 +555,16 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
         )
         return
 
-    sessions = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True,
-        text=True,
-    )
-    session_list = [s for s in sessions.stdout.strip().splitlines() if s]
-    if not session_list:
-        _ = await message.reply_text(
-            "No tmux session found. Start tmux on the host first."
-        )
-        return
-    attached = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{?session_attached,#{session_name},}"],
-        capture_output=True,
-        text=True,
-    )
-    attached_name = next(
-        (line for line in attached.stdout.strip().splitlines() if line), ""
-    )
-    session = attached_name or session_list[0]
-
-    logger.info("cmd_new: creating window in session=%r cwd=%s", session, cwd)
+    session_name = _pick_session_name(cwd)
+    logger.info("cmd_new: creating session=%r cwd=%s", session_name, cwd)
     try:
         created = subprocess.run(
             [
                 "tmux",
-                "new-window",
-                "-t",
-                f"{session}:",
+                "new-session",
+                "-d",  # detached — don't steal the user's current client
+                "-s",
+                session_name,
                 "-c",
                 cwd,
                 "-P",
@@ -334,15 +576,17 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
             check=True,
         )
     except subprocess.CalledProcessError as e:
-        logger.exception("cmd_new: tmux new-window failed")
-        _ = await message.reply_text(f"Failed to create pane: {e.stderr or e}")
+        logger.exception("cmd_new: tmux new-session failed")
+        _ = await message.reply_text(f"Failed to create session: {e.stderr or e}")
         return
     new_pane = created.stdout.strip()
     if not new_pane:
         logger.error("cmd_new: tmux returned empty pane id")
         _ = await message.reply_text("tmux didn't return a pane id.")
         return
-    logger.info("cmd_new: created pane %s, launching cc", new_pane)
+    logger.info(
+        "cmd_new: created pane %s in session %s, launching cc", new_pane, session_name
+    )
 
     time.sleep(0.4)
     _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "cc", "Enter"], check=True)
@@ -353,9 +597,10 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
     short_cwd = cwd.replace(os.path.expanduser("~"), "~")
     _ = await message.reply_text(
         f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
-        f"<code>{_html.escape(short_cwd)}</code> · session "
-        f"<code>{_html.escape(session)}</code>\n"
-        f"Launched <code>cc</code> · active + subscribed 🔔",
+        f"<code>{_html.escape(short_cwd)}</code>\n"
+        f"New session <code>{_html.escape(session_name)}</code> (detached) · "
+        f"Launched <code>cc</code> · active + subscribed 🔔\n"
+        f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>",
         parse_mode="HTML",
     )
 
@@ -398,7 +643,7 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text(
             "Usage: /pwd [%N] (or set an active pane via /use %N)"
@@ -423,7 +668,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text("Usage: /cancel %N (or set an active pane first)")
         return
@@ -441,7 +686,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text("Usage: /mute %N")
         return
@@ -453,7 +698,7 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text("Usage: /unmute %N")
         return
@@ -476,7 +721,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text("Usage: /subscribe %N")
         return
@@ -489,7 +734,7 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
-    pane_id = _pane_arg_or_active(message.chat_id, list(context.args or []))
+    pane_id = _pane_arg_or_active(message, list(context.args or []))
     if not pane_id:
         _ = await message.reply_text("Usage: /unsubscribe %N")
         return
@@ -519,7 +764,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif arg.isdigit():
             lines = max(1, min(int(arg), 500))
     if not pane_id:
-        pane_id = state.get_active_pane(message.chat_id)
+        pane_id = _pane_context(message)
     if not pane_id:
         _ = await message.reply_text("Usage: /history %N [lines]")
         return
@@ -589,6 +834,127 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
+        return
+
+    if data.startswith("mtg:"):
+        # Multi-select AskUserQuestion toggle. Each tap sends the digit
+        # keystroke to the pane (Claude's TUI toggles that option's
+        # checkbox) and flips the matching bit in the locally-tracked
+        # bitmask so the keyboard can redraw ☐/☑ to mirror the TUI state.
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            _ = await query.answer()
+            return
+        _, pane_id, idx_str, mask_str = parts
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            idx = int(idx_str)
+            mask = int(mask_str)
+        except ValueError:
+            _ = await query.answer()
+            return
+        try:
+            _send_key(pane_id, idx_str)  # digit keystroke = TUI toggle
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+            return
+        new_mask = mask ^ (1 << (idx - 1))
+        # Pull the option count from the existing keyboard shape (total
+        # rows minus the trailing Submit row) so we don't have to re-ship
+        # the option list in every callback_data.
+        current = message.reply_markup
+        n_options = 0
+        if current and current.inline_keyboard:
+            n_options = max(0, len(current.inline_keyboard) - 1)
+        if n_options == 0:
+            n_options = idx  # defensive fallback
+        new_rows: list[list[InlineKeyboardButton]] = []
+        for i in range(1, n_options + 1):
+            checked = "☑" if new_mask & (1 << (i - 1)) else "☐"
+            new_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{checked} {i}",
+                        callback_data=f"mtg:{pane_id}:{i}:{new_mask}",
+                    )
+                ]
+            )
+        new_rows.append(
+            [InlineKeyboardButton("✅ Submit", callback_data=f"msub:{pane_id}")]
+        )
+        try:
+            _ = await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(new_rows)
+            )
+        except Exception:
+            pass
+        _ = await query.answer(f"Toggled {idx}")
+        return
+
+    if data.startswith("msub:"):
+        # Multi-select "Submit" tap — advances the TUI from toggle mode to
+        # the "Review your answers / 1. Submit answers / 2. Cancel"
+        # screen. We don't finalize yet because the TUI still needs one
+        # more tap to confirm; swap the keyboard for that final pair so
+        # the user never has to type.
+        pane_id = data[len("msub:") :]
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            _send_key(pane_id, "Enter")
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+            return
+        finalise_rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    "✅ Submit answers",
+                    callback_data=f"mfin:{pane_id}:1",
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data=f"mfin:{pane_id}:2",
+                ),
+            ]
+        ]
+        try:
+            _ = await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(finalise_rows)
+            )
+        except Exception:
+            pass
+        _ = await query.answer("Review — tap to finalise")
+        return
+
+    if data.startswith("mfin:"):
+        # Final step of multi-select: send the digit (1=submit, 2=cancel)
+        # on the TUI's review screen. Matches the shape of the single-
+        # select `ans:` callback — digit + Enter so the TUI commits.
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            _ = await query.answer()
+            return
+        _, pane_id, choice = parts
+        if choice not in {"1", "2"}:
+            _ = await query.answer()
+            return
+        if not _pane_exists(pane_id):
+            _ = await query.answer(f"{pane_id} gone", show_alert=True)
+            return
+        try:
+            _send_to_tmux(pane_id, choice)
+        except subprocess.CalledProcessError as e:
+            _ = await query.answer(f"Failed: {e}", show_alert=True)
+            return
+        try:
+            _ = await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        label = "Submitted" if choice == "1" else "Cancelled"
+        _ = await query.answer(f"✅ {label} → {pane_id}", show_alert=True)
         return
 
     if data.startswith("qr:"):
@@ -898,6 +1264,56 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
 ]
 
 
+async def _verify_forum_mode(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
+    """Sanity-check forum-mode setup and log any missing prerequisites.
+
+    Non-fatal: if anything fails, the bot still runs — topic-related
+    code paths will simply no-op (the send_message fallback path
+    preserves legacy single-thread behavior). Better than refusing to
+    start; worst case the user sees log warnings and fixes perms.
+    """
+    if not _forum_enabled() or _FORUM_CHAT_ID is None:
+        return
+    try:
+        chat = await app.bot.get_chat(_FORUM_CHAT_ID)
+    except Exception:
+        logger.exception(
+            "Forum mode: getChat(%s) failed — topic features disabled",
+            _FORUM_CHAT_ID,
+        )
+        return
+    if not getattr(chat, "is_forum", False):
+        logger.warning(
+            "Forum mode: chat %s is not a forum. Enable Topics in the "
+            "supergroup settings or unset TELE_CLAUDE_SUPERGROUP_ID.",
+            _FORUM_CHAT_ID,
+        )
+        return
+    try:
+        me = await app.bot.get_me()
+        member = await app.bot.get_chat_member(_FORUM_CHAT_ID, me.id)
+    except Exception:
+        logger.exception(
+            "Forum mode: getChatMember failed — can't verify bot permissions",
+        )
+        return
+    can_manage_topics = getattr(member, "can_manage_topics", None)
+    can_delete_messages = getattr(member, "can_delete_messages", None)
+    missing: list[str] = []
+    if can_manage_topics is False:
+        missing.append("can_manage_topics")
+    if can_delete_messages is False:
+        missing.append("can_delete_messages")
+    if missing:
+        logger.warning(
+            "Forum mode: bot is missing admin perms %s — topic create/delete "
+            "will fail until granted.",
+            ", ".join(missing),
+        )
+    else:
+        logger.info("Forum mode: enabled, chat=%s is_forum=True", _FORUM_CHAT_ID)
+
+
 async def _publish_menu(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
     """Publish built-in commands + user-defined Claude shortcuts to Telegram.
 
@@ -915,6 +1331,7 @@ async def _publish_menu(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         label = f"→ Claude /{name}"
         menu.append(BotCommand(alias, desc if desc else label))
     await app.bot.set_my_commands(menu)
+    await _verify_forum_mode(app)
 
 
 _register_menu = _publish_menu  # back-compat alias kept for existing call sites

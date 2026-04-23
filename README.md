@@ -139,7 +139,7 @@ If `uv` isn't on the systemd PATH, replace `exec uv run tele-claude` with its ab
 | `/use %N` | Sets `%N` as the active pane without going through the picker. Accepts `/use 2` too. |
 | `/which` | Shows the current active pane. |
 | `/pwd [%N]` | Shows the pane's live working directory (`pane_current_path`) as a tap-to-copy code block. Falls back to active pane if omitted. |
-| `/new [dir]` | Spawn a fresh Claude pane in a new tmux window (defaults to `$HOME`; accepts `~/foo` or absolute paths). Launches `cc` in that shell (user's alias = `claude --dangerously-skip-permissions`), auto-subscribes the pane, and makes it the active pane — the next message you send goes there without `/use`. |
+| `/new [dir]` | Spawn a fresh Claude pane in a **new detached tmux session** named `claude-<basename>` (collision-suffixed: `-2`, `-3`, …). With a directory arg, spawns immediately (accepts `~/foo` or absolute paths). **Bare `/new` prompts via ForceReply** (misclick-safe from the ☰ Menu) — reply with a dir, or `.` to use `$HOME`. The new session shows up in `tmux ls`; attach anytime with `tmux attach -t <name>` (or `switch-client` from inside tmux). Launches `cc` in the pane (user's alias = `claude --dangerously-skip-permissions`), auto-subscribes it, and makes it the active pane — the next Telegram message goes there without `/use`, no attach needed. Detached means your current terminal never gets yanked. |
 | `/cancel [%N]` | Sends **Ctrl-C** to a pane (active pane if `%N` omitted). Stops a runaway turn from your phone. |
 | `/mute %N` | Stops forwarding `Notification` + `Stop` hook messages for that pane (still subscribed). |
 | `/unmute %N` | Resumes forwarding. |
@@ -163,7 +163,7 @@ A pane becomes **subscribed** the moment you:
 - tap its button in `/panes`, OR
 - run `/use %N` or `/subscribe %N`
 
-Hooks (`Notification`, `Stop`, `UserPromptSubmit`) check the subscription set first; unsubscribed panes exit the hook silently. Pair with `/mute` for temporary silencing that keeps the subscription, or `/unsubscribe` for a harder opt-out. Dead panes are purged from the subscribed set every time you run `/panes`.
+Hooks (`Notification`, `Stop`, `UserPromptSubmit`, `PostToolUse`, `SubagentStop`, `TeammateIdle`) check the subscription set first; unsubscribed panes exit the hook silently. Pair with `/mute` for temporary silencing that keeps the subscription, or `/unsubscribe` for a harder opt-out. Every `/panes` run calls `state.prune_panes()`, which sweeps dead pane IDs out of **all three** pane-keyed sections — `subscribed_panes`, `muted_panes`, and `active_pane` (per-chat) — so a closed pane never lingers in state.
 
 Badges in `/panes`:
 - `●` active + subscribed
@@ -239,6 +239,14 @@ When Claude Code asks for permission, you get a 🔐 message with three buttons:
 - **3 · Deny** — sends `3`
 
 No need to type — tap and go. (The digits match Claude Code's default permission UI.)
+
+**AskUserQuestion — single vs multi-select.** When Claude calls `AskUserQuestion` with `multiSelect=false` (default), each declared option becomes its own button labelled `1. <option label>`; one tap submits that choice. When `multiSelect=true`, the keyboard switches to a **toggle → submit → confirm** three-stage layout that mirrors Claude's TUI:
+
+1. **Toggle stage.** Each option renders as a compact `☐ N` / `☑ N` button (full option text stays in the message body above), with a trailing `✅ Submit` button. Each toggle tap sends the matching digit keystroke — which Claude's TUI interprets as "flip this checkbox" — and the bot redraws the keyboard with the updated ☐/☑ glyphs so your phone mirrors the TUI state.
+2. **Submit tap.** Tapping `✅ Submit` fires `Enter`, which advances the TUI from the toggle screen to its *"Review your answers — 1. Submit answers / 2. Cancel"* prompt.
+3. **Final confirm.** Bot swaps the keyboard for two buttons: `✅ Submit answers` (sends `1`) and `❌ Cancel` (sends `2`). Tapping either fires the decisive keystroke and clears the keyboard.
+
+Selection state during the toggle stage is encoded as a bitmask in `callback_data` (fits Telegram's 64-byte limit for up to 8 options), so there's no server-side session to lose across bot restarts.
 
 ### Progress indicator
 
@@ -486,29 +494,60 @@ From Telegram:
 - Callback data on inline buttons includes the `%PANE` it targets — the bot validates the pane still exists before acting
 - Credentials live in `~/.config/tele-claude/env` (chmod 600) and a single `Cache-Control` state file at `~/.cache/tele-claude/state.json`
 
-## Future work: forum-mode topics (one thread per pane)
+## Optional: forum-mode topics (one thread per pane)
 
-Currently all panes share a single Telegram chat. Responses and notifications from different panes interleave, and you rely on the `%PANE` tag in the header to know what's what. Telegram's **forum mode** (supergroups with "Topics" enabled) would give each pane its own thread — visually clean separation of concurrent work, especially when running 3+ Claude sessions in parallel.
+When the bot runs inside a Telegram **supergroup with Topics enabled**, each Claude pane gets its own forum topic — so concurrent panes no longer interleave in a single scrollback. Replies and notifications from pane `%15` land in topic `%15 · …`, `%9`'s land in `%9 · …`, etc. Posting a message *inside* a topic auto-routes to that pane with no `/use` dance. Disable by leaving `TELE_CLAUDE_SUPERGROUP_ID` unset — the bot silently falls back to single-thread mode.
 
-### Design sketch
+### Setup
 
-1. **Migrate the chat** from private 1:1 to a supergroup with topics enabled (via Bot API `createForumTopic`)
-2. **Map pane_id → topic_id** — stored in `state.json` under a new `topics` key. Created lazily: first time a pane fires a hook, the bot creates a topic named `project · %21` and caches the ID
-3. **All send calls acquire `message_thread_id`** — both the bot's command replies and the hooks' `sendMessage`. Bot helpers get a `pane_to_thread(pane_id)` accessor
-4. **Active pane becomes less central** — the topic you're viewing *is* the active pane. The active-pane state and `/use` command would still work as a fallback for the root chat
-5. **Topic lifecycle** — when a pane dies, optionally `closeForumTopic` or rename it to `🪦 %21 (closed)`. Garbage-collect in a periodic job or on `/panes` refresh
+1. **Create a new supergroup** in Telegram (private chat → can't enable topics)
+2. **Enable Topics** in the supergroup settings
+3. **Add the bot as admin** with these permissions:
+   - `Manage topics` (required for create/edit/delete)
+   - `Delete messages` (required for removing dead-pane topics)
+4. **Get the supergroup id** — send any message in the group, visit `https://api.telegram.org/bot<TOKEN>/getUpdates`, copy the negative `chat.id` (e.g. `-1001234567890`)
+5. **Set the env var** in `~/.config/tele-claude/env`:
+   ```bash
+   export TELE_CLAUDE_SUPERGROUP_ID="-1001234567890"
+   # Add the supergroup id to the auth list too — the bot only forwards to
+   # chats listed in CLAUDE_TELEGRAM_CHAT_ID.
+   export CLAUDE_TELEGRAM_CHAT_ID="123456789,-1001234567890"
+   ```
+6. **Restart the bot** (`systemctl --user restart tele-claude`). On startup it calls `getChat` + `getChatMember` to verify the chat is a forum and the bot has the right admin perms; any missing piece is logged as a warning (non-fatal — the bot keeps running in single-thread mode for other configured chats).
+7. **Run `/panes`** once in the supergroup — the bot creates one topic for every currently-live Claude pane.
 
-### Open questions
+### Topic naming
 
-- **Migration cost** — moving from private chat to supergroup loses message history. Either run both in parallel during transition or accept the reset
-- **Rate limits** — creating many topics in a burst (20+ panes at once) may hit Telegram's `createForumTopic` rate limit. Throttle + exponential backoff needed
-- **Permissions** — topics in supergroups need the bot added as admin with `can_manage_topics` permission. Document this in setup
-- **Fallback when topics disabled** — gracefully degrade to single-thread mode if the chat isn't a forum (detect via `getChat`)
-- **Per-topic ACL** — `CLAUDE_TELEGRAM_CHAT_ID` stays the allowlist; topic_id is only a destination, not a gate
+Each topic is named `%N · <live tmux title> · <full cwd>`:
 
-### Blocked on
+| Pane state | Example topic name |
+|------------|--------------------|
+| Working | `%15 · ⏳ 7t · Bash +2a · /home/you/Source/foo` |
+| Idle | `%9 · 💤 idle · /home/you/tele-claude` |
+| Permission pending | `%21 · 🔐 Edit · /home/you/genbook-mono` |
+| Just replied | `%21 · 🤖 Found 3 issues · /home/you/genbook-mono` |
 
-- Stabilizing the commands + hooks from this PR (currently implemented features) in real use for a week or two. Forum mode is a restructuring that's hard to reverse; better to confirm current UX is solid first
-- Deciding on migration strategy (fresh supergroup vs. convert private chat vs. parallel running)
+The name **refreshes every N Claude turns** so the topic list mirrors live activity without hammering Telegram's `editForumTopic` rate limit. Throttling is two-gated:
 
-No implementation yet — this section is the design anchor.
+- **Turn counter** — a per-pane counter increments on each Stop hook; rename fires when the counter hits `TELE_CLAUDE_TOPIC_RENAME_EVERY` (default **15**, min 1). Override by adding e.g. `export TELE_CLAUDE_TOPIC_RENAME_EVERY=10` to `~/.config/tele-claude/env`.
+- **Change detection** — skipped entirely when the composed name already matches the last-cached one (no-op API call avoided).
+
+### Lifecycle
+
+- **Lazy creation** — topics are created on first hook fire for a pane (or when `/panes` reconciles, whichever comes first). No migration command needed; `/panes` in the supergroup seeds topics for all currently-live panes.
+- **Bidirectional routing** — post a message inside topic `%15 · …` and it goes straight to pane `%15`. The topic you're viewing *is* the active pane; `/use %N` and reply-to still work as fallbacks from the main thread.
+- **Auto-delete on pane death** — `/panes` prunes dead panes from state and calls `deleteForumTopic` in the same pass. The topic is gone; scrollback with it. Matches the user's "don't keep zombies" preference.
+- **Resilient to manual deletion** — if you delete a topic by hand in Telegram, the next hook send retries without the stale thread id (landing in the main thread); `/panes` cleans up the orphan state on its next run.
+
+### Per-pane state (debug)
+
+`state.json` adds two keys when forum mode is active:
+
+```jsonc
+{
+  "pane_topics":       {"%9": 47, "%15": 53},
+  "pane_topic_names":  {"%9": "%9 · 💤 idle · /home/you/tele-claude"}
+}
+```
+
+`pane_topic_names` is a one-entry cache per pane so the Stage-3 renamer can skip the API call when the composed name hasn't changed — debug-friendly but doesn't need manual edits.

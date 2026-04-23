@@ -57,6 +57,14 @@ _MIN_RAW_SPLIT = 800
 # own idle_prompt fires at 60s (hardcoded upstream; see anthropics/claude-code#13922).
 _IDLE_SUPPRESS_SECONDS = float(os.environ.get("TELE_CLAUDE_IDLE_MIN_SECONDS", "900"))
 
+# Forum-mode topic rename throttle — fire ``editForumTopic`` once every
+# Nth Stop hook (per-pane counter in state). Default 15 ≈ "refresh every
+# 15 Claude turns"; set to 1 for every-turn renames (old behavior) or
+# higher to further slow down the cadence.
+_TOPIC_RENAME_EVERY_N = max(
+    1, int(os.environ.get("TELE_CLAUDE_TOPIC_RENAME_EVERY", "15"))
+)
+
 # Typing-indicator pumper: sendChatAction lasts 5 s per call, so the pumper
 # re-sends every _TYPING_PUMP_INTERVAL seconds while a turn is active.
 # _TYPING_PUMP_MAX_SECONDS is an absolute wall-clock ceiling (protects
@@ -82,6 +90,137 @@ def _token() -> str:
 def _chat_ids() -> list[str]:
     raw = os.environ.get("CLAUDE_TELEGRAM_CHAT_ID", "")
     return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def _forum_chat_id() -> str | None:
+    """Return the supergroup id when forum mode is enabled, else None.
+
+    Matches the bot's own ``TELE_CLAUDE_SUPERGROUP_ID`` env var (see
+    ``tele_claude.py`` for the matching read). Hooks and the bot read
+    the SAME variable so there's no drift between "bot thinks forum is
+    on" and "hooks think forum is on".
+    """
+    val = os.environ.get("TELE_CLAUDE_SUPERGROUP_ID", "").strip()
+    return val or None
+
+
+_TOPIC_NAME_MAX = 120
+_TOPIC_CWD_MAX = 60
+
+
+def _truncate_middle(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len < 3:
+        return text[:max_len]
+    keep = max_len - 1
+    head = keep // 2
+    tail = keep - head
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def _compose_topic_name(pane_id: str, pane_title: str, cwd: str) -> str:
+    title_part = pane_title.strip()
+    if len(title_part) > 40:
+        title_part = title_part[:37] + "…"
+    cwd_part = _truncate_middle(cwd, _TOPIC_CWD_MAX)
+    segments = [pane_id]
+    if title_part:
+        segments.append(title_part)
+    if cwd_part:
+        segments.append(cwd_part)
+    name = " · ".join(segments)
+    if len(name) > _TOPIC_NAME_MAX:
+        name = name[: _TOPIC_NAME_MAX - 1] + "…"
+    return name
+
+
+def _ensure_forum_topic(
+    chat_id: str, pane_id: str, pane_title: str, cwd: str
+) -> int | None:
+    """Return ``thread_id`` for this pane's topic, creating it lazily.
+
+    First looks up persistent state. On miss, issues ``createForumTopic``
+    with a ``%N · <title> · <cwd>`` name and persists the returned
+    thread_id. Returns None if the API call fails — callers pass through
+    to the send API's thread-invalid fallback (drops the thread id and
+    lands the message in the supergroup's main thread).
+
+    Only valid when ``chat_id`` is the forum chat; caller enforces that.
+    """
+    existing = state.get_topic(pane_id)
+    if existing is not None:
+        return existing
+    name = _compose_topic_name(pane_id, pane_title, cwd)
+    resp = _call("createForumTopic", {"chat_id": chat_id, "name": name})
+    if not resp.get("ok"):
+        return None
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return None
+    raw_thread = result.get("message_thread_id")
+    if not isinstance(raw_thread, (int, str)):
+        return None
+    try:
+        thread_id = int(raw_thread)
+    except (TypeError, ValueError):
+        return None
+    state.set_topic(pane_id, thread_id)
+    state.set_cached_topic_name(pane_id, name)
+    return thread_id
+
+
+def _topic_for_chat(
+    chat_id: str, pane_id: str, pane_title: str = "", cwd: str = ""
+) -> int | None:
+    """Resolve the ``message_thread_id`` for ``chat_id`` + ``pane_id``.
+
+    Returns None when (a) forum mode is off, (b) ``chat_id`` isn't the
+    forum chat (private-chat fan-out targets shouldn't get a thread),
+    or (c) ``pane_id`` is empty (rare — hook missing ``TMUX_PANE``).
+    In the happy path, creates the topic if it doesn't exist yet and
+    returns its thread id.
+    """
+    forum_id = _forum_chat_id()
+    if not forum_id or not pane_id:
+        return None
+    if str(chat_id) != str(forum_id):
+        return None
+    return _ensure_forum_topic(chat_id, pane_id, pane_title, cwd)
+
+
+def _maybe_rename_topic(chat_id: str, pane_id: str, pane_title: str, cwd: str) -> None:
+    """Refresh the topic name to reflect current activity.
+
+    Called from Stop-hook on every Claude turn, but throttled by a
+    **turn counter** (default: fire once every 15 turns — configurable
+    via ``TELE_CLAUDE_TOPIC_RENAME_EVERY``). Second gate is change
+    detection: skip if the composed name matches the last-cached one.
+    Together they keep us well under Telegram's ``editForumTopic``
+    rate limit even with many panes all finishing turns in quick
+    succession.
+    """
+    forum_id = _forum_chat_id()
+    if not forum_id or str(chat_id) != str(forum_id) or not pane_id:
+        return
+    thread_id = state.get_topic(pane_id)
+    if thread_id is None:
+        return
+    new_name = _compose_topic_name(pane_id, pane_title, cwd)
+    if state.get_cached_topic_name(pane_id) == new_name:
+        return
+    if not state.should_rename_topic(pane_id, _TOPIC_RENAME_EVERY_N):
+        return
+    resp = _call(
+        "editForumTopic",
+        {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "name": new_name,
+        },
+    )
+    if resp.get("ok"):
+        state.set_cached_topic_name(pane_id, new_name)
 
 
 _DEBUG_LOG = Path.home() / ".cache" / "tele-claude" / "debug" / "api-errors.log"
@@ -148,6 +287,7 @@ def send_message(
     parse_mode: str | None = None,
     reply_markup: dict[str, Any] | None = None,
     disable_notification: bool = False,
+    message_thread_id: int | None = None,
 ) -> int | None:
     """Send a Telegram message.
 
@@ -157,22 +297,25 @@ def send_message(
     of a split reply so the user only gets ONE phone buzz per turn
     (when the actual response arrives).
 
+    When ``message_thread_id`` is non-None, the message lands in that
+    forum topic. Used in forum mode so each pane's messages go to its
+    own thread. None (the default) = legacy single-thread behavior.
+
     Resilience: if the initial call fails with parse_mode=HTML, we
     retry once as plain text (parse_mode=None) with the HTML entities
     unescaped so the user at least sees the content. Silent HTML-parse
     400s were previously causing whole chunks to vanish from split
     replies — a 4-of-4 reply would arrive as 3-of-4 with no indication.
     """
-    resp = _call(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-            "reply_markup": reply_markup,
-            "disable_notification": disable_notification or None,
-        },
-    )
+    base: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "reply_markup": reply_markup,
+        "disable_notification": disable_notification or None,
+        "message_thread_id": message_thread_id,
+    }
+    resp = _call("sendMessage", base)
     if resp.get("ok"):
         return int(resp["result"]["message_id"])
     err = str(resp.get("description") or "")
@@ -182,16 +325,15 @@ def send_message(
     if reply_markup is not None and (
         "inline keyboard button URL" in err or "Wrong HTTP URL" in err
     ):
-        retry = _call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "reply_markup": None,
-                "disable_notification": disable_notification or None,
-            },
-        )
+        retry = _call("sendMessage", {**base, "reply_markup": None})
+        if retry.get("ok"):
+            return int(retry["result"]["message_id"])
+    # Topic deleted/unknown? Retry without the thread id — the message
+    # still lands in the supergroup's main thread so the user sees it.
+    # Telegram returns "message thread not found" (sometimes localised
+    # as "TOPIC_DELETED" or "message thread ID is invalid").
+    if message_thread_id is not None and ("thread" in err.lower() or "TOPIC" in err):
+        retry = _call("sendMessage", {**base, "message_thread_id": None})
         if retry.get("ok"):
             return int(retry["result"]["message_id"])
     # HTML-parse failure? Degrade to plain text so the user still sees
@@ -208,6 +350,7 @@ def send_message(
                 "parse_mode": None,
                 "reply_markup": None,
                 "disable_notification": disable_notification or None,
+                "message_thread_id": message_thread_id,
             },
         )
         if resp.get("ok"):
@@ -700,8 +843,15 @@ def _build_permission_keyboard(
 ) -> dict[str, Any] | None:
     """Pick the right inline keyboard for a pending permission.
 
-    AskUserQuestion gets one button per declared option (1..N) so
-    tapping sends the matching digit that Claude's TUI expects.
+    AskUserQuestion with ``multiSelect=false`` (default) gets one button
+    per declared option (1..N) — tapping submits that single choice.
+    With ``multiSelect=true`` we render toggle buttons (☐/☑ N) plus a
+    dedicated Submit button: each tap sends the digit keystroke to
+    Claude's TUI (which toggles the matching checkbox) and Submit sends
+    Enter. State is mirrored as a bitmask in callback_data so the
+    keyboard redraws to reflect the checked set without needing
+    server-side storage.
+
     ExitPlanMode uses 2 buttons (Approve / Keep planning). Everything
     else falls back to Allow once / Always / Deny.
     """
@@ -712,10 +862,39 @@ def _build_permission_keyboard(
         inp = tool.get("input") or {}
         questions = inp.get("questions") if isinstance(inp, dict) else None
         if isinstance(questions, list) and questions and isinstance(questions[0], dict):
-            options = questions[0].get("options")
+            first = questions[0]
+            options = first.get("options")
+            is_multi = bool(first.get("multiSelect"))
             if isinstance(options, list) and options:
-                rows: list[list[dict[str, Any]]] = []
-                for idx, opt in enumerate(options[:8], start=1):
+                n = min(len(options), 8)
+                if is_multi:
+                    # Compact labels (just "☐ N") — the full option text
+                    # already lives in the message body (rendered by
+                    # _permission_subject), so redrawing the keyboard on
+                    # every toggle stays small and fits Telegram's
+                    # 64-byte callback_data limit (mask up to 255).
+                    rows: list[list[dict[str, Any]]] = []
+                    for idx in range(1, n + 1):
+                        rows.append(
+                            [
+                                {
+                                    "text": f"☐ {idx}",
+                                    "callback_data": f"mtg:{pane_id}:{idx}:0",
+                                }
+                            ]
+                        )
+                    rows.append(
+                        [
+                            {
+                                "text": "✅ Submit",
+                                "callback_data": f"msub:{pane_id}",
+                            }
+                        ]
+                    )
+                    return {"inline_keyboard": rows}
+                # Single-select: one tap = immediate submission.
+                rows = []
+                for idx, opt in enumerate(options[:n], start=1):
                     label = ""
                     if isinstance(opt, dict):
                         label = str(opt.get("label") or "")
@@ -811,7 +990,11 @@ def _clear_heartbeat_if_session(session_id: str) -> None:
 
 
 def _edit_or_resend_progress(
-    chat_id: str, session_id: str, msg_id: int, text: str
+    chat_id: str,
+    session_id: str,
+    msg_id: int,
+    text: str,
+    message_thread_id: int | None = None,
 ) -> None:
     """Edit the existing ⏳ placeholder OR recover by sending a fresh one.
 
@@ -822,6 +1005,10 @@ def _edit_or_resend_progress(
     and send a new placeholder, updating the progress file so future
     edits target the new message. For other errors (rate-limit, parse),
     we just skip this tick — the next heartbeat will try again.
+
+    ``message_thread_id`` is used only for the resurrection send (edits
+    don't need a thread id — they address by message_id which is unique
+    across the chat).
     """
     ok, err = edit_message(chat_id, msg_id, text, parse_mode="HTML")
     if ok:
@@ -830,7 +1017,11 @@ def _edit_or_resend_progress(
     # "message is not modified" → same content, expected no-op.
     if "message to edit not found" in err:
         new_id = send_message(
-            chat_id, text, parse_mode="HTML", disable_notification=True
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_notification=True,
+            message_thread_id=message_thread_id,
         )
         if new_id is not None:
             state.set_progress_msg_id(f"{session_id}:{chat_id}", new_id)
@@ -865,11 +1056,13 @@ def main_reply() -> None:
     # First line of the reply as pane title — shows what Claude
     # finished with so users can tell idle panes apart in /panes.
     first_line = raw_md.strip().splitlines()[0] if raw_md.strip() else ""
+    # Strip markdown heading/formatting chars for a cleaner title.
+    cleaned = (
+        first_line.lstrip("# *_-").strip().replace("*", "").replace("`", "")[:40]
+        if first_line
+        else ""
+    )
     if first_line:
-        # Strip markdown heading/formatting chars for a cleaner title.
-        cleaned = (
-            first_line.lstrip("# *_-").strip().replace("*", "").replace("`", "")[:40]
-        )
         _set_pane_title(pane_id, f"🤖 {cleaned}" if cleaned else "🤖 done")
 
     # Dedup: skip if the same body was sent within the TTL.
@@ -890,9 +1083,14 @@ def main_reply() -> None:
         else None
     )
 
+    # Compose the live topic-name once per turn. We'll reuse it for send
+    # thread-id resolution AND for the Stage 3 rename below.
+    topic_title = f"🤖 {cleaned}" if first_line and cleaned else "🤖 done"
+
     for chat_id in _chat_ids():
         progress_key = f"{session_id}:{chat_id}"
         progress_id = state.get_progress_msg_id(progress_key)
+        thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
 
         # Delete the ⏳ placeholder (if any) so the real reply arrives as
         # a fresh sendMessage — which triggers a push notification.
@@ -917,7 +1115,13 @@ def main_reply() -> None:
                 parse_mode="HTML",
                 reply_markup=markup,
                 disable_notification=silent,
+                message_thread_id=thread_id,
             )
+
+        # Stage 3: refresh the topic name to match the pane_title we just
+        # set (🤖 <preview>). Throttle + change-detection live inside the
+        # helper so per-turn firing is safe.
+        _maybe_rename_topic(chat_id, pane_id, topic_title, cwd)
 
         state.clear_progress(progress_key)
     # Turn done — reset the heartbeat throttle for the next turn.
@@ -995,33 +1199,52 @@ def main_notify() -> None:
         text = header + "\n\n" + "\n\n".join(body_parts)
 
     reply_markup: dict[str, Any] | None = None
+    topic_title = ""
     if notif_type == "permission_prompt":
         reply_markup = _build_permission_keyboard(pane_id, pending_tool)
         tool_name = (
             str(pending_tool.get("name")) if pending_tool else ""
         ) or "permission"
         _set_pane_title(pane_id, f"🔐 {tool_name}")
+        topic_title = f"🔐 {tool_name}"
     elif notif_type == "idle_prompt":
         _set_pane_title(pane_id, "💤 idle")
+        topic_title = "💤 idle"
 
     for chat_id in _chat_ids():
-        send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
+        thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
+        send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            message_thread_id=thread_id,
+        )
 
 
 # ---------- Mode: progress ----------
 
 
-def _spawn_typing_pumper(session_id: str, chat_id: str) -> None:
+def _spawn_typing_pumper(
+    session_id: str, chat_id: str, thread_id: int | None = None
+) -> None:
     """Launch a detached pumper that keeps the 'typing…' indicator alive.
 
     Runs as a separate process with its own session so parent shells
     exiting don't kill it. The pumper itself exits when the progress
     file disappears (Stop hook cleared it) or the max-time cap fires.
     Environment is inherited so the child sees the bot token.
+
+    ``thread_id`` (optional) restricts the typing indicator to a forum
+    topic so only the pane's own thread shows "typing…". Passed as a
+    5th argv so the detached process reads it back without needing IPC.
     """
+    argv = [sys.executable, os.path.abspath(__file__), "pump", session_id, chat_id]
+    if thread_id is not None:
+        argv.append(str(thread_id))
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "pump", session_id, chat_id],
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1059,16 +1282,22 @@ def main_progress() -> None:
     body = html.escape(preview, quote=False) if preview else "<i>Claude is working…</i>"
     text = f"{header}\n\n{body}"
 
+    topic_title = f"⏳ {preview_title}" if preview_title else "⏳ working"
     for chat_id in _chat_ids():
+        thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
         # ⏳ placeholders go SILENT — the user just sent the prompt,
         # they don't need a phone buzz confirming that. Only the final
         # 🤖 reply (Stop hook) fires a push notification.
         msg_id = send_message(
-            chat_id, text, parse_mode="HTML", disable_notification=True
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_notification=True,
+            message_thread_id=thread_id,
         )
         if msg_id is not None:
             state.set_progress_msg_id(f"{session_id}:{chat_id}", msg_id)
-            _spawn_typing_pumper(session_id, chat_id)
+            _spawn_typing_pumper(session_id, chat_id, thread_id)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -1246,11 +1475,15 @@ def main_post_tool_use() -> None:
         lines.append(f"<blockquote expandable>{html.escape(preview)}</blockquote>")
     text = f"{header}\n\n" + "\n\n".join(lines)
 
+    topic_title = " ".join(title_bits)
     for chat_id in chat_ids:
         msg_id = state.get_progress_msg_id(f"{session_id}:{chat_id}")
         if msg_id is None:
             continue
-        edit_message(chat_id, msg_id, text, parse_mode="HTML")
+        thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
+        _edit_or_resend_progress(
+            chat_id, session_id, msg_id, text, message_thread_id=thread_id
+        )
 
 
 def main_subagent_stop() -> None:
@@ -1334,10 +1567,14 @@ def main_subagent_stop() -> None:
         lines.append(f"<blockquote expandable>{html.escape(preview)}</blockquote>")
     text = f"{header}\n\n" + "\n\n".join(lines)
 
+    topic_title = " ".join(title_bits)
     for chat_id in chat_ids:
         msg_id = state.get_progress_msg_id(f"{session_id}:{chat_id}")
         if msg_id is not None:
-            _edit_or_resend_progress(chat_id, session_id, msg_id, text)
+            thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
+            _edit_or_resend_progress(
+                chat_id, session_id, msg_id, text, message_thread_id=thread_id
+            )
 
 
 def main_teammate_idle() -> None:
@@ -1379,8 +1616,10 @@ def main_teammate_idle() -> None:
     # The Send-msg button uses a force-reply on tap so the user can type
     # a response that the bot (eventually) can route back — out of scope
     # for this hook; for now, we simply notify.
+    topic_title = f"🧑‍💻 {label}"
     for chat_id in _chat_ids():
-        send_message(chat_id, text, parse_mode="HTML")
+        thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
+        send_message(chat_id, text, parse_mode="HTML", message_thread_id=thread_id)
 
     # Debug-friendly: agent_id persists in the notification for audit but
     # doesn't need surfacing unless we add routing. Keep the send simple.
@@ -1390,19 +1629,30 @@ def main_teammate_idle() -> None:
 def main_pump() -> None:
     """Entry point for the typing-indicator pumper subprocess.
 
-    Expected argv: [hooks.py, "pump", <session_id>, <chat_id>].
+    Expected argv: ``[hooks.py, "pump", <session_id>, <chat_id>,
+    <thread_id?>]``. The optional 5th arg keeps the "typing…" indicator
+    scoped to a forum topic in forum mode.
     """
     if len(sys.argv) < 4:
         return
     session_id = sys.argv[2]
     chat_id = sys.argv[3]
+    thread_id: int | None = None
+    if len(sys.argv) >= 5:
+        try:
+            thread_id = int(sys.argv[4])
+        except ValueError:
+            thread_id = None
     progress_key = f"{session_id}:{chat_id}"
     deadline = time.monotonic() + _TYPING_PUMP_MAX_SECONDS
     while time.monotonic() < deadline:
         if state.get_progress_msg_id(progress_key) is None:
             return
+        payload: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
+        if thread_id is not None:
+            payload["message_thread_id"] = thread_id
         try:
-            _call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            _call("sendChatAction", payload)
         except Exception:
             pass
         time.sleep(_TYPING_PUMP_INTERVAL)

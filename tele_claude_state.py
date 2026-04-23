@@ -127,7 +127,12 @@ def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
     """Remove dead panes from every pane-keyed state section.
 
     Returns (removed_subscribed, removed_muted) for user-facing reporting.
-    `active_pane` entries pointing at dead panes are also cleared.
+    `active_pane` entries pointing at dead panes are also cleared. Forum-
+    mode topic entries (``pane_topics`` + ``pane_topic_names``) are also
+    pruned here so the supergroup side stays in sync; callers that need
+    the released thread_ids should use ``pop_topics_for_dead_panes``
+    BEFORE calling this (we don't return them because most callers only
+    care about the subscription/mute deltas).
     """
     state = _load()
     changed = False
@@ -153,9 +158,177 @@ def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
             state["active_pane"] = active
             changed = True
 
+    topics = state.get("pane_topics")
+    if isinstance(topics, dict):
+        dead_topic_keys = [p for p in topics if p not in alive_pane_ids]
+        for p in dead_topic_keys:
+            del topics[p]
+        if dead_topic_keys:
+            state["pane_topics"] = topics
+            changed = True
+
+    topic_names = state.get("pane_topic_names")
+    if isinstance(topic_names, dict):
+        dead_name_keys = [p for p in topic_names if p not in alive_pane_ids]
+        for p in dead_name_keys:
+            del topic_names[p]
+        if dead_name_keys:
+            state["pane_topic_names"] = topic_names
+            changed = True
+
     if changed:
         _save(state)
     return dead_subs, dead_muted
+
+
+# ---------- Forum-mode pane topics (supergroup + topics) ----------
+#
+# When the bot runs in a supergroup with Topics enabled, each Claude
+# pane gets its own topic (forum thread). ``pane_topics`` maps
+# ``%pane_id`` → numeric ``thread_id`` so hooks can land their
+# sendMessage in the right topic. ``pane_topic_names`` caches the most
+# recent ``%N · <title> · <cwd>`` string so the Stop-hook rename path
+# can avoid redundant editForumTopic calls (rate-limit hygiene).
+#
+# Entries are created lazily on first hook fire (or on /panes
+# reconciliation) and deleted in two places:
+# 1) When the owning pane is pruned — handled inside ``prune_panes``.
+# 2) When the bot calls ``deleteForumTopic`` on the Telegram side — the
+#    caller should call ``pop_topic`` to keep state and Telegram in sync.
+
+
+def get_topic(pane_id: str) -> int | None:
+    topics = _load().get("pane_topics")
+    if not isinstance(topics, dict):
+        return None
+    raw = topics.get(pane_id)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_topic(pane_id: str, thread_id: int) -> None:
+    state = _load()
+    topics = state.get("pane_topics")
+    if not isinstance(topics, dict):
+        topics = {}
+    topics[pane_id] = int(thread_id)
+    state["pane_topics"] = topics
+    _save(state)
+
+
+def pop_topic(pane_id: str) -> int | None:
+    """Remove and return the thread_id for ``pane_id`` (or None)."""
+    state = _load()
+    topics = state.get("pane_topics")
+    if not isinstance(topics, dict) or pane_id not in topics:
+        return None
+    try:
+        thread_id = int(topics[pane_id])
+    except (TypeError, ValueError):
+        thread_id = None
+    del topics[pane_id]
+    state["pane_topics"] = topics
+    # Drop the cached name too — a re-created topic should re-send the
+    # rename on its first turn instead of silently matching a stale cache.
+    names = state.get("pane_topic_names")
+    if isinstance(names, dict) and pane_id in names:
+        del names[pane_id]
+        state["pane_topic_names"] = names
+    _save(state)
+    return thread_id
+
+
+def get_all_topics() -> dict[str, int]:
+    """Return the ``%pane -> thread_id`` map (or empty dict)."""
+    topics = _load().get("pane_topics")
+    if not isinstance(topics, dict):
+        return {}
+    result: dict[str, int] = {}
+    for pane, raw in topics.items():
+        if not isinstance(pane, str):
+            continue
+        try:
+            result[pane] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def get_pane_by_thread(thread_id: int) -> str | None:
+    """Reverse lookup: find which pane owns a given topic thread_id.
+
+    Used on inbound messages so a message posted inside topic
+    ``%15 · …`` auto-routes to pane ``%15`` without needing /use or a
+    reply-to. Linear scan of the topics dict — fine for the pane counts
+    we expect (tens at most).
+    """
+    target = int(thread_id)
+    for pane, tid in get_all_topics().items():
+        if tid == target:
+            return pane
+    return None
+
+
+def get_cached_topic_name(pane_id: str) -> str | None:
+    names = _load().get("pane_topic_names")
+    if not isinstance(names, dict):
+        return None
+    value = names.get(pane_id)
+    return value if isinstance(value, str) else None
+
+
+def set_cached_topic_name(pane_id: str, name: str) -> None:
+    state = _load()
+    names = state.get("pane_topic_names")
+    if not isinstance(names, dict):
+        names = {}
+    names[pane_id] = name
+    state["pane_topic_names"] = names
+    _save(state)
+
+
+# ---------- Topic-rename throttle (turn-counter based) ----------
+
+
+def _topic_rename_file(pane_id: str) -> Path:
+    path = _cache_root() / "topic_rename"
+    path.mkdir(parents=True, exist_ok=True)
+    safe = pane_id.replace("/", "_").replace(":", "_")
+    return path / f"{safe}.n"
+
+
+def should_rename_topic(pane_id: str, every_n_turns: int = 15) -> bool:
+    """Fire ``editForumTopic`` once every N turns for this pane.
+
+    Counter-based (not time-based) — the per-pane file tracks how many
+    Stop-hook fires have happened since the last rename. Returns True
+    (and resets the counter) exactly on the Nth call; returns False
+    otherwise. This keeps us well under Telegram's rate limit without
+    tying cadence to wall clock — a pane that runs one turn every hour
+    still gets renamed every N turns, not every 30 s.
+
+    A threshold of 1 means "rename every turn" (the old behavior);
+    defaults to 15 so big sessions with frequent Stops don't hammer
+    the rename API.
+    """
+    if every_n_turns <= 1:
+        return True
+    path = _topic_rename_file(pane_id)
+    try:
+        current = int(path.read_text().strip())
+    except (OSError, ValueError):
+        current = 0
+    new = current + 1
+    fire = new >= every_n_turns
+    if fire:
+        new = 0  # reset counter after firing
+    try:
+        path.write_text(str(new))
+    except OSError:
+        pass
+    return fire
 
 
 # ---------- Muted panes (global across chats) ----------
