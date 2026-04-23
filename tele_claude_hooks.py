@@ -104,6 +104,30 @@ def _forum_chat_id() -> str | None:
     return val or None
 
 
+def _hook_chat_ids() -> list[str]:
+    """Chats hooks should actually fan out to.
+
+    In forum mode (``TELE_CLAUDE_SUPERGROUP_ID`` set), this defaults to
+    ONLY the forum chat — the user's private DM gets silence because
+    it would otherwise double-notify for every pane (the supergroup
+    topic and the private chat both ping). Bot commands from the
+    private chat still work — ``CHAT_IDS`` gates auth independently.
+
+    To restore the old fan-out (ping every authorised chat), set
+    ``TELE_CLAUDE_FORUM_EXCLUSIVE=0`` in ``~/.config/tele-claude/env``.
+    """
+    forum_id = _forum_chat_id()
+    if not forum_id:
+        return _chat_ids()
+    exclusive = os.environ.get("TELE_CLAUDE_FORUM_EXCLUSIVE", "1").strip() != "0"
+    if not exclusive:
+        return _chat_ids()
+    # Keep only the forum chat (still has to be in CHAT_IDS — defensive
+    # filter handles the edge case where SUPERGROUP_ID is set but the
+    # chat wasn't added to CLAUDE_TELEGRAM_CHAT_ID).
+    return [c for c in _chat_ids() if c == forum_id]
+
+
 _TOPIC_NAME_MAX = 120
 _TOPIC_CWD_MAX = 60
 
@@ -1087,7 +1111,7 @@ def main_reply() -> None:
     # thread-id resolution AND for the Stage 3 rename below.
     topic_title = f"🤖 {cleaned}" if first_line and cleaned else "🤖 done"
 
-    for chat_id in _chat_ids():
+    for chat_id in _hook_chat_ids():
         progress_key = f"{session_id}:{chat_id}"
         progress_id = state.get_progress_msg_id(progress_key)
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
@@ -1211,7 +1235,7 @@ def main_notify() -> None:
         _set_pane_title(pane_id, "💤 idle")
         topic_title = "💤 idle"
 
-    for chat_id in _chat_ids():
+    for chat_id in _hook_chat_ids():
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
         send_message(
             chat_id,
@@ -1283,7 +1307,7 @@ def main_progress() -> None:
     text = f"{header}\n\n{body}"
 
     topic_title = f"⏳ {preview_title}" if preview_title else "⏳ working"
-    for chat_id in _chat_ids():
+    for chat_id in _hook_chat_ids():
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
         # ⏳ placeholders go SILENT — the user just sent the prompt,
         # they don't need a phone buzz confirming that. Only the final
@@ -1421,7 +1445,7 @@ def main_post_tool_use() -> None:
         return
 
     # Don't heartbeat unless there's actually a ⏳ placeholder to edit.
-    chat_ids = _chat_ids()
+    chat_ids = _hook_chat_ids()
     any_pending = any(
         state.get_progress_msg_id(f"{session_id}:{c}") is not None for c in chat_ids
     )
@@ -1516,7 +1540,7 @@ def main_subagent_stop() -> None:
     if not transcript_path.exists():
         return
 
-    chat_ids = _chat_ids()
+    chat_ids = _hook_chat_ids()
     any_pending = any(
         state.get_progress_msg_id(f"{session_id}:{c}") is not None for c in chat_ids
     )
@@ -1617,7 +1641,7 @@ def main_teammate_idle() -> None:
     # a response that the bot (eventually) can route back — out of scope
     # for this hook; for now, we simply notify.
     topic_title = f"🧑‍💻 {label}"
-    for chat_id in _chat_ids():
+    for chat_id in _hook_chat_ids():
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
         send_message(chat_id, text, parse_mode="HTML", message_thread_id=thread_id)
 

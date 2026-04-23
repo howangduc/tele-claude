@@ -539,6 +539,18 @@ The name **refreshes every N Claude turns** so the topic list mirrors live activ
 - **Auto-delete on pane death** — `/panes` prunes dead panes from state and calls `deleteForumTopic` in the same pass. The topic is gone; scrollback with it. Matches the user's "don't keep zombies" preference.
 - **Resilient to manual deletion** — if you delete a topic by hand in Telegram, the next hook send retries without the stale thread id (landing in the main thread); `/panes` cleans up the orphan state on its next run.
 
+### Private chat silence (forum-exclusive mode)
+
+By default, enabling forum mode silences hook notifications to your **private DM with the bot** — the supergroup topic already pings you, and double-notifying is just noise. Bot commands from the private chat still work (authorisation is independent); only the outbound hook messages (⏳, 🤖, 🔐, 💤) stop landing there.
+
+To restore the old fan-out (every authorised chat gets every hook), set:
+
+```bash
+export TELE_CLAUDE_FORUM_EXCLUSIVE=0
+```
+
+in `~/.config/tele-claude/env` and restart the bot.
+
 ### Per-pane state (debug)
 
 `state.json` adds two keys when forum mode is active:
