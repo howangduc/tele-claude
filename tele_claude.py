@@ -6,6 +6,7 @@ Commands (single source of truth is ``_COMMANDS`` near the bottom):
   /which             — show the active pane.
   /pwd [%N]          — show pane's live working directory.
   /new [dir]         — spawn a fresh detached tmux session running cc; bare invocation prompts via ForceReply.
+  /get <path>        — upload a server-side file to Telegram as a document; bare invocation prompts via ForceReply.
   /cancel [%N]       — send Ctrl-C to a pane (active if omitted).
   /mute %N           — silence Notification + Stop hooks for that pane.
   /unmute %N         — re-enable hooks.
@@ -127,6 +128,7 @@ _BUILTIN_COMMANDS = {
     "which",
     "pwd",
     "new",
+    "get",
     "cancel",
     "mute",
     "unmute",
@@ -674,6 +676,115 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ = await message.reply_text(
         f"<b>{_html.escape(pane_id)}</b>\n<code>{_html.escape(path)}</code>",
         parse_mode="HTML",
+    )
+
+
+# Telegram's sendDocument caps uploads at 50 MB; leave a small margin.
+_GET_MAX_BYTES = 49 * 1024 * 1024
+
+
+async def _send_file_to_user(message: Message, path_arg: str) -> None:
+    """Resolve ``path_arg``, validate, and upload as a Telegram document.
+
+    Shared between the direct ``/get <path>`` call and the ForceReply
+    dispatch for bare ``/get``. Relative paths are resolved against the
+    context pane's ``pane_current_path`` so e.g. ``/get report.md`` from
+    inside topic ``%21`` looks in pane ``%21``'s cwd.
+    """
+    path_arg = path_arg.strip().strip('"').strip("'")
+    if not path_arg:
+        _ = await message.reply_text("Missing path.")
+        return
+    path = os.path.expanduser(path_arg)
+    if not os.path.isabs(path):
+        pane = _pane_context(message)
+        if not pane or not _pane_exists(pane):
+            _ = await message.reply_text(
+                "Relative path given but no active pane to resolve against. "
+                "Use an absolute path or set an active pane via /use."
+            )
+            return
+        probe = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_path}"],
+            capture_output=True,
+            text=True,
+        )
+        base = probe.stdout.strip()
+        if base:
+            path = os.path.normpath(os.path.join(base, path))
+    if not os.path.exists(path):
+        _ = await message.reply_text(
+            f"Not found: <code>{_html.escape(path)}</code>", parse_mode="HTML"
+        )
+        return
+    if os.path.isdir(path):
+        _ = await message.reply_text(
+            f"Is a directory: <code>{_html.escape(path)}</code>", parse_mode="HTML"
+        )
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        _ = await message.reply_text(
+            f"Can't stat <code>{_html.escape(path)}</code>: {exc}", parse_mode="HTML"
+        )
+        return
+    if size > _GET_MAX_BYTES:
+        _ = await message.reply_text(
+            f"Too large: {size / 1024 / 1024:.1f} MB "
+            f"(Telegram sendDocument cap: 50 MB)."
+        )
+        return
+    try:
+        with open(path, "rb") as fh:
+            # reply_document uploads via sendDocument — inherits the
+            # inbound message's thread_id so in forum mode the file
+            # lands in the same topic the user requested it from.
+            _ = await message.reply_document(
+                document=fh,
+                filename=os.path.basename(path),
+                caption=(
+                    f"<code>{_html.escape(path)}</code> · {size:,} bytes"
+                    if size
+                    else f"<code>{_html.escape(path)}</code> · empty"
+                ),
+                parse_mode="HTML",
+            )
+        logger.info("cmd_get: sent %s (%d bytes)", path, size)
+    except Exception as exc:  # pragma: no cover — Telegram / file I/O
+        logger.exception("cmd_get: failed to upload %s", path)
+        _ = await message.reply_text(f"Failed to upload: {exc}")
+
+
+async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Upload a server-side file to Telegram as a downloadable document.
+
+    Usage:
+      /get <path>     → bot uploads the file to the current chat/topic
+      /get            → ForceReply prompts for a path
+
+    Paths may be absolute, ``~``-prefixed, or relative to the context
+    pane's cwd (the pane that owns the current topic, or the chat's
+    active pane). Handy for pulling back markdown reports, log files,
+    PDFs, or code that Claude wrote on the server — anything under the
+    50 MB Telegram sendDocument limit.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    if args:
+        await _send_file_to_user(message, " ".join(args))
+        return
+    _ = await message.reply_text(
+        f"{_ARGS_PROMPT_PREFIX}get?\n\n"
+        "Reply with an absolute path, <code>~</code>-path, or a relative "
+        "path (resolved against the active pane's cwd).",
+        parse_mode="HTML",
+        reply_markup=ForceReply(
+            input_field_placeholder="path (e.g. ~/report.md)",
+            selective=True,
+        ),
     )
 
 
@@ -1289,6 +1400,9 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
             if canonical == "new":
                 await _spawn_new_pane(message, args)
                 return
+            if canonical == "get":
+                await _send_file_to_user(message, args)
+                return
             await _forward_shortcut_to_pane(message, canonical, args)
             return
 
@@ -1328,6 +1442,7 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("which", "Show the active pane", cmd_which),
     ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
     ("new", "Spawn a new Claude pane: /new [dir]", cmd_new),
+    ("get", "Upload a server file to Telegram: /get <path>", cmd_get),
     ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
     ("mute", "Silence hooks: /mute %N", cmd_mute),
     ("unmute", "Re-enable hooks: /unmute %N", cmd_unmute),
