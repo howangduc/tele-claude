@@ -79,6 +79,19 @@ IMAGE_DIR = Path(
     or str(Path.home() / ".cache" / "tele-claude" / "images")
 )
 
+# Where to stash inbound non-image documents (txt, pdf, md, code, logs, …).
+# Claude Code's Read tool handles pdf + text; everything else still reads
+# fine as raw bytes. Overridable via TELE_CLAUDE_FILE_DIR.
+FILE_DIR = Path(
+    os.environ.get("TELE_CLAUDE_FILE_DIR")
+    or str(Path.home() / ".cache" / "tele-claude" / "files")
+)
+
+# Filenames coming from Telegram may contain path separators or shell
+# metacharacters — neutralise before we write to disk. Keeps letters,
+# digits, dot, dash, underscore; collapses everything else to underscore.
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 # Forum mode: when set, the bot runs inside a supergroup that has Topics
 # enabled, and each Claude pane gets its own topic (forum thread). Value
@@ -1137,28 +1150,80 @@ async def on_slash_passthrough(
     await _forward_shortcut_to_pane(message, canonical, rest.strip())
 
 
-async def on_photo(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Download an incoming image and hand its absolute path to the active pane.
+def _safe_filename(name: str) -> str:
+    """Sanitize a Telegram-supplied filename for disk use.
 
-    Accepts both PHOTO (compressed) and Document.IMAGE (original quality).
-    Caption, if any, is forwarded before the path so Claude has context.
+    Strips any path component (defence-in-depth for ``../evil.txt``),
+    replaces anything outside ``[A-Za-z0-9._-]`` with ``_``, and
+    clamps the total length so odd filenames don't blow past the
+    filesystem's per-name limit.
+    """
+    base = os.path.basename(name) or "file"
+    safe = _FILENAME_SAFE_RE.sub("_", base).strip("._") or "file"
+    return safe[:120]
+
+
+async def on_attachment(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward any attached file (image or document) to the active pane.
+
+    Handles three cases:
+
+    * **PHOTO** — compressed image from the gallery. Saved to
+      ``IMAGE_DIR`` with a deterministic ``tg_<msg>_<uniq>.jpg`` name.
+    * **Document with image/* mime** — "send as file" from the gallery,
+      keeps original quality. Also lands in ``IMAGE_DIR`` with the
+      original extension preserved.
+    * **Any other Document** — txt, md, pdf, log, code files, zips,
+      whatever. Saved to ``FILE_DIR`` with the original filename
+      sanitised for disk safety. Claude Code's Read tool handles pdf
+      + text transparently; binaries still read as raw bytes.
+
+    Caption, if any, is sent first so Claude sees context before the
+    file path: ``<caption>\\n<abs_path>``. Reply to the Telegram user
+    names the file so they can tell multi-attachment sends apart.
     """
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
 
     tg_file = None
-    suffix = "jpg"
+    out_path: Path | None = None
+    reply_emoji = "📎"
+    reply_label: str = ""
+
     if message.photo:
+        # Compressed photo — only msg_id+unique identifies it.
         photo = message.photo[-1]
         tg_file = await photo.get_file()
-        unique = photo.file_unique_id
-    elif message.document and (message.document.mime_type or "").startswith("image/"):
-        tg_file = await message.document.get_file()
-        unique = message.document.file_unique_id
-        original = message.document.file_name or ""
-        if "." in original:
-            suffix = original.rsplit(".", 1)[-1].lower()
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = IMAGE_DIR / f"tg_{message.message_id}_{photo.file_unique_id}.jpg"
+        reply_emoji = "🖼"
+    elif message.document:
+        doc = message.document
+        tg_file = await doc.get_file()
+        mime = (doc.mime_type or "").lower()
+        original = doc.file_name or ""
+        suffix = original.rsplit(".", 1)[-1].lower() if "." in original else ""
+        if mime.startswith("image/"):
+            # Original-quality photo — treat as image.
+            IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+            safe_suffix = suffix or "jpg"
+            out_path = (
+                IMAGE_DIR
+                / f"tg_{message.message_id}_{doc.file_unique_id}.{safe_suffix}"
+            )
+            reply_emoji = "🖼"
+        else:
+            # Any other document — preserve the original filename so
+            # Claude sees meaningful context ("this is `error.log`").
+            # Prefix with msg_id for collision safety.
+            FILE_DIR.mkdir(parents=True, exist_ok=True)
+            safe_name = _safe_filename(
+                original or f"file.{suffix}" if suffix else "file"
+            )
+            out_path = FILE_DIR / f"tg_{message.message_id}_{safe_name}"
+            reply_label = original or safe_name
+            reply_emoji = "📄"
     else:
         return
 
@@ -1174,24 +1239,35 @@ async def on_photo(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = IMAGE_DIR / f"tg_{message.message_id}_{unique}.{suffix}"
     _ = await tg_file.download_to_drive(str(out_path))
 
     caption = (message.caption or "").strip()
     text = f"{caption}\n{out_path}" if caption else str(out_path)
 
-    logger.info("Image → tmux pane %s: %s (caption=%r)", pane_id, out_path, caption)
+    logger.info(
+        "%s → tmux pane %s: %s (caption=%r)", reply_emoji, pane_id, out_path, caption
+    )
     try:
         _send_to_tmux(pane_id, text)
+        suffix_label = (
+            f" <code>{_html.escape(reply_label)}</code>" if reply_label else ""
+        )
         _ = await message.reply_text(
-            f"🖼 → {pane_id}", reply_to_message_id=message.message_id
+            f"{reply_emoji}{suffix_label} → {pane_id}",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
         )
     except subprocess.CalledProcessError as e:
         _ = await message.reply_text(
             f"Failed to send to pane {pane_id}: {e}",
             reply_to_message_id=message.message_id,
         )
+
+
+# Back-compat alias — the MessageHandler filter was registered under
+# ``on_photo`` name for a long time. Keep it around in case anything
+# imports it.
+on_photo = on_attachment
 
 
 async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1342,7 +1418,11 @@ def main() -> None:
     for name, _desc, handler in _COMMANDS:
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    # Accept photos + any document (txt, md, pdf, code, logs, zips, …).
+    # Explicitly NOT filters.ATTACHMENT because that would also forward
+    # videos + audio + voice notes, which Claude can't do much with.
+    # Dispatched to ``on_attachment`` which branches on type internally.
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))
     app.add_handler(MessageHandler(filters.COMMAND, on_slash_passthrough))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     logger.info("Bot started, polling...")

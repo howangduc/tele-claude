@@ -217,18 +217,39 @@ Claude Code's in-session commands (`/sdlc`, `/using-superpowers`, `/brainstormin
 
 **Preloaded shortcuts on fresh install.** None by default — run `/shortcut add <name>` for each Claude command you use often. Keep the list lean (5-10 favourites) so the autocomplete stays skimmable.
 
-### Sending images to Claude Code
+### Sending files to Claude Code
 
-Attach any photo (or forward one) to the bot chat and it goes straight to the active pane — same resolution rules as text.
+Attach anything — photo, screenshot, `.txt`, `.md`, `.pdf`, `.log`, code file, zip — and it lands in your active pane (or the topic's pane in forum mode).
 
-- **Photo** (compressed, default when you attach from gallery) and **Document** image (original quality, sent "as file") are both accepted
-- Saved under `~/.cache/tele-claude/images/tg_<msg_id>_<file_unique_id>.<ext>` — deterministic, dedup-safe
-- Claude Code picks up the absolute path and loads the image via its vision capability
-- **With a caption**: the caption is sent first (on its own line), then the path — Claude reads the instruction and the image together: `check this screenshot for errors\n/home/you/.cache/tele-claude/images/tg_123_abc.jpg`
-- **Without a caption**: just the path — follow up with text afterwards and Claude remembers the image
-- Override destination via `export TELE_CLAUDE_IMAGE_DIR=/path/to/dir` in `~/.config/tele-claude/env`
+| Attachment type | Saved to | Reply emoji |
+|---|---|---|
+| Compressed photo (default "Photo" send) | `~/.cache/tele-claude/images/tg_<msg>_<uniq>.jpg` | 🖼 |
+| Image as Document (original quality, "send as file" from gallery) | `~/.cache/tele-claude/images/tg_<msg>_<uniq>.<ext>` | 🖼 |
+| Any other document (txt, md, pdf, log, code, …) | `~/.cache/tele-claude/files/tg_<msg>_<sanitised-filename>` | 📄 |
 
-> **Albums (multiple photos in one send):** Telegram delivers each as its own message; the bot forwards them one by one in order.
+The original filename is preserved (sanitised for disk safety) for non-image documents so Claude sees meaningful context — `tg_123_error.log` instead of `tg_123_<hash>.bin`. Path separators and shell metacharacters are scrubbed defensively.
+
+**With a caption** — the caption lands first, then the path, so Claude reads the instruction and the file together:
+
+```
+check this stack trace
+/home/you/.cache/tele-claude/files/tg_123_error.log
+```
+
+**Without a caption** — just the path. Follow up with text and Claude still has the file in context.
+
+**What Claude does with them:**
+- Images → vision capability reads them directly
+- PDFs, text, markdown, code, logs → Claude's `Read` tool handles them natively
+- Binary/unknown → still saved and path delivered; Claude can inspect bytes or tell you it can't parse it
+
+**Overrides** in `~/.config/tele-claude/env`:
+- `export TELE_CLAUDE_IMAGE_DIR=/path/to/images`
+- `export TELE_CLAUDE_FILE_DIR=/path/to/files`
+
+**Size limit:** Telegram's Bot API caps document downloads at 20 MB. Anything bigger fails the download and the bot replies with a "no active pane" / download-error message.
+
+> **Albums (multiple photos or files in one send):** Telegram delivers each as its own message; the bot forwards them one by one in order.
 
 ### Permission prompts from your phone
 
