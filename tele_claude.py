@@ -93,6 +93,19 @@ FILE_DIR = Path(
 # digits, dot, dash, underscore; collapses everything else to underscore.
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Command sent to a freshly-spawned tmux pane by ``/new``. Defaults to
+# the explicit ``TELE_CLAUDE=1 claude --dangerously-skip-permissions``
+# form so it works on machines that haven't set up the ``cc`` / ``claude``
+# bashrc aliases yet — fresh installs were silently failing because
+# ``cc`` resolved to "command not found", the pane stayed bash, and
+# /panes filtered it out (filter requires pane_current_command=*claude*).
+# Override per machine via ``TELE_CLAUDE_NEW_LAUNCH_CMD`` for users who
+# want a custom binary or extra flags.
+_NEW_LAUNCH_CMD = os.environ.get(
+    "TELE_CLAUDE_NEW_LAUNCH_CMD",
+    "TELE_CLAUDE=1 claude --dangerously-skip-permissions",
+)
+
 
 # Forum mode: when set, the bot runs inside a supergroup that has Topics
 # enabled, and each Claude pane gets its own topic (forum thread). Value
@@ -600,11 +613,20 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
         _ = await message.reply_text("tmux didn't return a pane id.")
         return
     logger.info(
-        "cmd_new: created pane %s in session %s, launching cc", new_pane, session_name
+        "cmd_new: created pane %s in session %s, launching %r",
+        new_pane,
+        session_name,
+        _NEW_LAUNCH_CMD,
     )
 
     time.sleep(0.4)
-    _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "cc", "Enter"], check=True)
+    # Send the launch command literally (-l = literal, no key parsing) then
+    # press Enter. Using literal mode keeps env-var prefixes intact (e.g.
+    # ``TELE_CLAUDE=1 claude …``) regardless of the user's bash aliases.
+    _ = subprocess.run(
+        ["tmux", "send-keys", "-t", new_pane, "-l", _NEW_LAUNCH_CMD], check=True
+    )
+    _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "Enter"], check=True)
 
     state.subscribe_pane(new_pane)
     state.set_active_pane(message.chat_id, new_pane)
@@ -614,7 +636,7 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
         f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
         f"<code>{_html.escape(short_cwd)}</code>\n"
         f"New session <code>{_html.escape(session_name)}</code> (detached) · "
-        f"Launched <code>cc</code> · active + subscribed 🔔\n"
+        f"Launched <code>{_html.escape(_NEW_LAUNCH_CMD)}</code> · active + subscribed 🔔\n"
         f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>",
         parse_mode="HTML",
     )
