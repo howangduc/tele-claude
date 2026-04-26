@@ -323,17 +323,34 @@ Append to `~/.bashrc` (or `~/.zshrc`):
 ```bash
 # tele-claude: every `claude` forwards to Telegram by default
 alias claude='TELE_CLAUDE=1 command claude'
+
+# Optional but recommended: short alias that also bypasses permission
+# prompts. Bash recursively expands aliases, so `cc` chains through to
+#   TELE_CLAUDE=1 command claude --dangerously-skip-permissions
+alias cc='claude --dangerously-skip-permissions'
 ```
+
+Then `source ~/.bashrc` (or open a fresh terminal) so the aliases are live in your current shell. **Required on every machine you set up the bot on** — without these aliases, hooks can't forward (since `TELE_CLAUDE` isn't set on the claude process).
 
 Usage:
 
 | Command | Behavior |
 |---------|----------|
-| `claude` | Forwards notifications + responses to Telegram |
+| `cc` | Shortest path — bypass perms + forward to Telegram |
+| `claude` | Forwards notifications + responses to Telegram (no perm bypass) |
 | `command claude` | Runs Claude silently (bypasses the alias) |
 | `TELE_CLAUDE=0 claude` | One-off silent override |
 
-> Prefer explicit opt-in? Use `tclaude() { TELE_CLAUDE=1 claude "$@"; }` and invoke `tclaude` on the sessions you want forwarded, plain `claude` for the rest.
+Verify the chain after sourcing:
+
+```bash
+type claude   # claude is aliased to `TELE_CLAUDE=1 command claude'
+type cc       # cc is aliased to `claude --dangerously-skip-permissions'
+```
+
+> Prefer explicit opt-in? Skip the `claude` alias and use a function instead: `tclaude() { TELE_CLAUDE=1 claude "$@"; }` — invoke `tclaude` on the sessions you want forwarded, plain `claude` for the rest.
+
+> **Already-running claude sessions don't pick up new aliases.** `TELE_CLAUDE=1` is fixed at process start, so a claude that was running before you added the aliases keeps firing hooks with `TELE_CLAUDE=` empty (silent). Inside it, type `/exit` to drop back to bash, then `source ~/.bashrc && cc` to relaunch with the aliases active.
 
 ### 3. Install the hook wrappers
 
