@@ -180,30 +180,67 @@ def _list_claude_panes() -> list[tuple[str, str, str]]:
     Title comes from tmux's pane_title attribute — our hooks update
     it on every prompt / tool call / reply so /panes can show what
     each pane is actually doing, not just the working directory.
+
+    Local patch: macOS Claude Code overrides its process name to its
+    version (e.g. ``2.1.119``), so the original ``#{m:*claude*,#{pane_current_command}}``
+    filter misses it. We list panes unfiltered, then walk each pane's
+    pid subtree and match against the full argv via ``ps -o command``.
     """
     result = subprocess.run(
         [
             "tmux",
             "list-panes",
             "-a",
-            # Tab-separated so paths/titles with spaces stay intact.
             "-F",
-            "#{pane_id}\t#{pane_current_path}\t#{pane_title}",
-            "-f",
-            "#{m:*claude*,#{pane_current_command}}",
+            "#{pane_id}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}",
         ],
         capture_output=True,
         text=True,
     )
+    ps_proc = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid=,command="],
+        capture_output=True,
+        text=True,
+    )
+    children: dict[int, list[int]] = {}
+    cmdline: dict[int, str] = {}
+    for raw in ps_proc.stdout.splitlines():
+        parts = raw.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        cmdline[pid] = parts[2]
+        children.setdefault(ppid, []).append(pid)
+
+    def _subtree_has_claude(root: int) -> bool:
+        stack = [root]
+        seen: set[int] = set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if "claude" in cmdline.get(pid, "").lower():
+                return True
+            stack.extend(children.get(pid, []))
+        return False
+
     panes: list[tuple[str, str, str]] = []
     for line in result.stdout.strip().splitlines():
         if not line:
             continue
         parts = line.split("\t")
-        pane_id = parts[0] if len(parts) > 0 else ""
-        path = parts[1] if len(parts) > 1 else ""
-        title = parts[2] if len(parts) > 2 else ""
-        if pane_id:
+        if len(parts) < 4:
+            continue
+        pane_id, pane_pid_s, path, title = parts[0], parts[1], parts[2], parts[3]
+        try:
+            pane_pid = int(pane_pid_s)
+        except ValueError:
+            continue
+        if pane_id and _subtree_has_claude(pane_pid):
             panes.append((pane_id, path, title))
     return panes
 
