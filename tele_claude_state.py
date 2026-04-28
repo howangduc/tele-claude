@@ -19,13 +19,12 @@ import tempfile
 import time
 from pathlib import Path
 
+import constants
+
 
 def _cache_root() -> Path:
-    root = Path(
-        os.environ.get("TELE_CLAUDE_STATE_DIR", Path.home() / ".cache" / "tele-claude")
-    )
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    constants.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return constants.STATE_DIR
 
 
 def _state_path() -> Path:

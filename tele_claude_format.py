@@ -23,6 +23,8 @@ import html
 import re
 import sys
 
+import constants
+
 _CODE_PLACEHOLDER = "\x00C{}\x00"
 _INLINE_PLACEHOLDER = "\x00I{}\x00"
 _TABLE_PLACEHOLDER = "\x00T{}\x00"
@@ -86,8 +88,9 @@ _SEP_RE = re.compile(r"^\s*\|[\s\-:|]+\|\s*$")
 
 # Max total monospace width that fits without wrapping on a typical
 # mobile Telegram client at default font size. Above this we switch
-# from aligned <pre> tables to vertical bullet blocks.
-_PRE_MAX_WIDTH = 34
+# from aligned <pre> tables to vertical bullet blocks. Source-of-truth
+# in ``constants.PRE_MAX_WIDTH``.
+_PRE_MAX_WIDTH = constants.PRE_MAX_WIDTH
 
 
 def _stash_tables(text: str, sink: list[str]) -> str:

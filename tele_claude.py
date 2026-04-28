@@ -5,7 +5,7 @@ Commands (single source of truth is ``_COMMANDS`` near the bottom):
   /use %N            — set active pane without the picker.
   /which             — show the active pane.
   /pwd [%N]          — show pane's live working directory.
-  /new [dir]         — spawn a fresh detached tmux session running cc; bare invocation prompts via ForceReply.
+  /new [dir]         — spawn a fresh detached tmux session running claude; bare invocation prompts via ForceReply.
   /get <path>        — upload a server-side file to Telegram as a document; bare invocation prompts via ForceReply.
   /cancel [%N]       — send Ctrl-C to a pane (active if omitted).
   /mute %N           — silence Notification + Stop hooks for that pane.
@@ -62,6 +62,7 @@ from telegram.ext import (
     filters,
 )
 
+import constants
 import tele_claude_state as state
 
 logging.basicConfig(level=logging.INFO)
@@ -74,62 +75,21 @@ CHAT_IDS: frozenset[int] = frozenset(
     if chunk.strip()
 )
 
-# Where to stash inbound images so Claude Code can pick them up via file path.
-IMAGE_DIR = Path(
-    os.environ.get("TELE_CLAUDE_IMAGE_DIR")
-    or str(Path.home() / ".cache" / "tele-claude" / "images")
-)
-
-# Where to stash inbound non-image documents (txt, pdf, md, code, logs, …).
-# Claude Code's Read tool handles pdf + text; everything else still reads
-# fine as raw bytes. Overridable via TELE_CLAUDE_FILE_DIR.
-FILE_DIR = Path(
-    os.environ.get("TELE_CLAUDE_FILE_DIR")
-    or str(Path.home() / ".cache" / "tele-claude" / "files")
-)
+# Inbound media destinations live in ``constants`` (env-overridable
+# via TELE_CLAUDE_IMAGE_DIR / TELE_CLAUDE_FILE_DIR).
+IMAGE_DIR = constants.IMAGE_DIR
+FILE_DIR = constants.FILE_DIR
 
 # Filenames coming from Telegram may contain path separators or shell
 # metacharacters — neutralise before we write to disk. Keeps letters,
 # digits, dot, dash, underscore; collapses everything else to underscore.
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-# Command sent to a freshly-spawned tmux pane by ``/new``. Defaults to
-# the explicit ``TELE_CLAUDE=1 claude --dangerously-skip-permissions``
-# form so it works on machines that haven't set up the ``cc`` / ``claude``
-# bashrc aliases yet — fresh installs were silently failing because
-# ``cc`` resolved to "command not found", the pane stayed bash, and
-# /panes filtered it out (filter requires pane_current_command=*claude*).
-# Override per machine via ``TELE_CLAUDE_NEW_LAUNCH_CMD`` for users who
-# want a custom binary or extra flags.
-_NEW_LAUNCH_CMD = os.environ.get(
-    "TELE_CLAUDE_NEW_LAUNCH_CMD",
-    "TELE_CLAUDE=1 claude --dangerously-skip-permissions",
-)
-
-
-# Forum mode: when set, the bot runs inside a supergroup that has Topics
-# enabled, and each Claude pane gets its own topic (forum thread). Value
-# is the supergroup id (negative int, e.g. -1001234567890). Unset → bot
-# runs in legacy single-thread mode (private chat or plain group) and
-# every topic-related code path short-circuits.
-def _read_forum_chat_id() -> int | None:
-    raw = os.environ.get("TELE_CLAUDE_SUPERGROUP_ID", "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-_FORUM_CHAT_ID: int | None = _read_forum_chat_id()
-
-# Telegram caps forum-topic names at 128 chars; we stay well under it.
-_TOPIC_NAME_MAX = 120
-
-# Width budget for the `cwd` segment of the topic name before we start
-# ellipsising it. Leaves room for pane id, title, and two separators.
-_TOPIC_CWD_MAX = 60
+# Forum mode: when set, the bot runs inside a supergroup that has
+# Topics enabled and each Claude pane gets its own topic. Value is
+# the supergroup id (negative int, e.g. -1001234567890). Resolved
+# in ``constants`` from TELE_CLAUDE_SUPERGROUP_ID.
+_FORUM_CHAT_ID: int | None = constants.FORUM_CHAT_ID
 
 _PANE_RE = re.compile(r"(?<!\w)%\d+(?!\w)")
 
@@ -153,10 +113,10 @@ _BUILTIN_COMMANDS = {
     "shortcut",
 }
 
-# Prefix used on our "waiting for args" prompt messages. The reply handler
-# detects these by checking reply_to_message.text against this prefix, then
-# extracts the canonical command name from the rest of the line.
-_ARGS_PROMPT_PREFIX = "Args for /"
+# Alias to ``constants.ARGS_PROMPT_PREFIX`` — the reply handler
+# detects "waiting for args" prompts by matching reply_to_message.text
+# against this prefix, then extracts the canonical command name.
+_ARGS_PROMPT_PREFIX = constants.ARGS_PROMPT_PREFIX
 
 # Reply text values that mean "send the command without any args".
 _SKIP_ARGS_TOKENS = frozenset({"", ".", "-", "/", "skip", "go", "bare"})
@@ -265,16 +225,16 @@ def _send_to_tmux(pane_id: str, text: str) -> None:
     # rather than as rapid-fire keystrokes.
     if "\n" in text:
         _ = subprocess.run(
-            ["tmux", "load-buffer", "-b", "tele-claude-tmp", "-"],
+            ["tmux", "load-buffer", "-b", constants.TMUX_PASTE_BUFFER, "-"],
             input=text,
             text=True,
             check=True,
         )
         _ = subprocess.run(
-            ["tmux", "paste-buffer", "-b", "tele-claude-tmp", "-t", pane_id, "-d"],
+            ["tmux", "paste-buffer", "-b", constants.TMUX_PASTE_BUFFER, "-t", pane_id, "-d"],
             check=True,
         )
-        time.sleep(0.3)
+        time.sleep(constants.PASTE_SETTLE_DELAY)
     else:
         _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], check=True)
     _ = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
@@ -357,15 +317,15 @@ def _compose_topic_name(pane_id: str, pane_title: str, cwd: str) -> str:
     title_part = pane_title.strip()
     if len(title_part) > 40:
         title_part = title_part[:37] + "…"
-    cwd_part = _truncate_middle(cwd, _TOPIC_CWD_MAX)
+    cwd_part = _truncate_middle(cwd, constants.TOPIC_CWD_MAX)
     segments = [pane_id]
     if title_part:
         segments.append(title_part)
     if cwd_part:
         segments.append(cwd_part)
     name = " · ".join(segments)
-    if len(name) > _TOPIC_NAME_MAX:
-        name = name[: _TOPIC_NAME_MAX - 1] + "…"
+    if len(name) > constants.TOPIC_NAME_MAX:
+        name = name[: constants.TOPIC_NAME_MAX - 1] + "…"
     return name
 
 
@@ -592,16 +552,16 @@ def _pick_session_name(cwd: str) -> str:
         ).stdout.splitlines()
         if line
     }
-    candidate = f"claude-{safe}"
+    candidate = f"{constants.TMUX_SESSION_PREFIX}{safe}"
     i = 2
     while candidate in existing:
-        candidate = f"claude-{safe}-{i}"
+        candidate = f"{constants.TMUX_SESSION_PREFIX}{safe}-{i}"
         i += 1
     return candidate
 
 
 async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
-    """Spawn a fresh detached tmux session running ``cc`` and subscribe it.
+    """Spawn a fresh detached tmux session running ``constants.LAUNCH_CMD`` and subscribe it.
 
     Each ``/new`` gets its own session (not just a window) so concurrent
     Claude tasks stay isolated — independent scrollback, single
@@ -653,17 +613,21 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
         "cmd_new: created pane %s in session %s, launching %r",
         new_pane,
         session_name,
-        _NEW_LAUNCH_CMD,
+        constants.LAUNCH_CMD,
     )
 
-    time.sleep(0.4)
-    # Send the launch command literally (-l = literal, no key parsing) then
-    # press Enter. Using literal mode keeps env-var prefixes intact (e.g.
-    # ``TELE_CLAUDE=1 claude …``) regardless of the user's bash aliases.
+    time.sleep(constants.SPAWN_SETTLE_DELAY)
+    # ``-l`` (literal) so ``=`` and spaces in LAUNCH_CMD are typed
+    # verbatim instead of being parsed as tmux key names. Enter is
+    # sent as a separate key sequence (no ``-l``) to actually submit.
     _ = subprocess.run(
-        ["tmux", "send-keys", "-t", new_pane, "-l", _NEW_LAUNCH_CMD], check=True
+        ["tmux", "send-keys", "-t", new_pane, "-l", constants.LAUNCH_CMD],
+        check=True,
     )
-    _ = subprocess.run(["tmux", "send-keys", "-t", new_pane, "Enter"], check=True)
+    _ = subprocess.run(
+        ["tmux", "send-keys", "-t", new_pane, "Enter"],
+        check=True,
+    )
 
     state.subscribe_pane(new_pane)
     state.set_active_pane(message.chat_id, new_pane)
@@ -673,7 +637,7 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
         f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
         f"<code>{_html.escape(short_cwd)}</code>\n"
         f"New session <code>{_html.escape(session_name)}</code> (detached) · "
-        f"Launched <code>{_html.escape(_NEW_LAUNCH_CMD)}</code> · active + subscribed 🔔\n"
+        f"Launched <code>{_html.escape(constants.LAUNCH_CMD)}</code> · active + subscribed 🔔\n"
         f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>",
         parse_mode="HTML",
     )
@@ -940,12 +904,12 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not message or not _authorised(message.chat_id):
         return
     pane_id: str | None = None
-    lines = 20
+    lines = constants.HISTORY_DEFAULT_LINES
     for arg in context.args or []:
         if arg.startswith("%"):
             pane_id = _normalise_pane(arg)
         elif arg.isdigit():
-            lines = max(1, min(int(arg), 500))
+            lines = max(1, min(int(arg), constants.HISTORY_MAX_LINES))
     if not pane_id:
         pane_id = _pane_context(message)
     if not pane_id:
@@ -965,8 +929,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not body:
         _ = await message.reply_text(f"Pane {pane_id} is empty.")
         return
-    if len(body) > 3500:
-        body = "…\n" + body[-3500:]
+    if len(body) > constants.HISTORY_BODY_TRIM:
+        body = "…\n" + body[-constants.HISTORY_BODY_TRIM :]
     safe = _html.escape(body, quote=False)
     _ = await message.reply_text(
         f"<b>{pane_id}</b> · last {lines} lines\n<pre>{safe}</pre>",
@@ -1330,7 +1294,7 @@ def _safe_filename(name: str) -> str:
     """
     base = os.path.basename(name) or "file"
     safe = _FILENAME_SAFE_RE.sub("_", base).strip("._") or "file"
-    return safe[:120]
+    return safe[: constants.FILENAME_MAX_LEN]
 
 
 async def on_attachment(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:

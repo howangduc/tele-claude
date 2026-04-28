@@ -38,43 +38,21 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
+import constants
 import tele_claude_format
 import tele_claude_state as state
 
 
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-MAX_MESSAGE_LEN = (
-    4000  # Telegram's hard limit is 4096; leave room for header + HTML margin
-)
-
-# Markdown → HTML can inflate text by 20-50% (adding <b>, <code>, <pre> tags).
-# Start the split at this budget and iteratively shrink if conversion overshoots.
-_RAW_SPLIT_BUDGET = 2500
-_MIN_RAW_SPLIT = 800
-
-# Idle notifications get suppressed unless this many seconds have passed since
-# the session's last real activity (UserPromptSubmit or Stop). Claude Code's
-# own idle_prompt fires at 60s (hardcoded upstream; see anthropics/claude-code#13922).
-_IDLE_SUPPRESS_SECONDS = float(os.environ.get("TELE_CLAUDE_IDLE_MIN_SECONDS", "900"))
-
-# Forum-mode topic rename throttle — fire ``editForumTopic`` once every
-# Nth Stop hook (per-pane counter in state). Default 15 ≈ "refresh every
-# 15 Claude turns"; set to 1 for every-turn renames (old behavior) or
-# higher to further slow down the cadence.
-_TOPIC_RENAME_EVERY_N = max(
-    1, int(os.environ.get("TELE_CLAUDE_TOPIC_RENAME_EVERY", "15"))
-)
-
-# Typing-indicator pumper: sendChatAction lasts 5 s per call, so the pumper
-# re-sends every _TYPING_PUMP_INTERVAL seconds while a turn is active.
-# _TYPING_PUMP_MAX_SECONDS is an absolute wall-clock ceiling (protects
-# against truly-orphaned pumpers), but the pumper also exits early as
-# soon as the progress file disappears. Raised from 10 min → 45 min
-# because long Agent-Team / Task fan-out turns can legitimately run
-# longer than 10 min and users were watching the typing indicator go
-# dead on healthy long turns.
-_TYPING_PUMP_INTERVAL = 4.0
-_TYPING_PUMP_MAX_SECONDS = 2700.0  # 45 min
+# Behavioral constants now live in ``constants`` — these aliases keep
+# call sites readable (and let editors jump-to-def in one hop).
+TELEGRAM_API = constants.TELEGRAM_API
+MAX_MESSAGE_LEN = constants.MAX_MESSAGE_LEN
+_RAW_SPLIT_BUDGET = constants.RAW_SPLIT_BUDGET
+_MIN_RAW_SPLIT = constants.MIN_RAW_SPLIT
+_IDLE_SUPPRESS_SECONDS = constants.IDLE_SUPPRESS_SECONDS
+_TOPIC_RENAME_EVERY_N = constants.TOPIC_RENAME_EVERY_N
+_TYPING_PUMP_INTERVAL = constants.TYPING_PUMP_INTERVAL
+_TYPING_PUMP_MAX_SECONDS = constants.TYPING_PUMP_MAX_SECONDS
 
 
 # ---------- HTTP ----------
@@ -100,8 +78,7 @@ def _forum_chat_id() -> str | None:
     the SAME variable so there's no drift between "bot thinks forum is
     on" and "hooks think forum is on".
     """
-    val = os.environ.get("TELE_CLAUDE_SUPERGROUP_ID", "").strip()
-    return val or None
+    return str(constants.FORUM_CHAT_ID) if constants.FORUM_CHAT_ID is not None else None
 
 
 def _hook_chat_ids() -> list[str]:
@@ -119,8 +96,7 @@ def _hook_chat_ids() -> list[str]:
     forum_id = _forum_chat_id()
     if not forum_id:
         return _chat_ids()
-    exclusive = os.environ.get("TELE_CLAUDE_FORUM_EXCLUSIVE", "1").strip() != "0"
-    if not exclusive:
+    if not constants.FORUM_EXCLUSIVE:
         return _chat_ids()
     # Keep only the forum chat (still has to be in CHAT_IDS — defensive
     # filter handles the edge case where SUPERGROUP_ID is set but the
@@ -128,8 +104,8 @@ def _hook_chat_ids() -> list[str]:
     return [c for c in _chat_ids() if c == forum_id]
 
 
-_TOPIC_NAME_MAX = 120
-_TOPIC_CWD_MAX = 60
+_TOPIC_NAME_MAX = constants.TOPIC_NAME_MAX
+_TOPIC_CWD_MAX = constants.TOPIC_CWD_MAX
 
 
 def _truncate_middle(text: str, max_len: int) -> str:
@@ -280,7 +256,7 @@ def _call(method: str, data: dict[str, Any]) -> dict[str, Any]:
     req = Request(url, data=urlencode(body).encode())
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        with urlopen(req, timeout=10) as resp:
+        with urlopen(req, timeout=constants.HTTP_TIMEOUT) as resp:
             return json.loads(resp.read())
     except Exception as exc:
         # Try to extract Telegram's actual error body from HTTPError so
@@ -645,7 +621,7 @@ def _quick_reply_keyboard(pane_id: str) -> list[list[dict[str, Any]]]:
 def _wait_for_stable_text(
     transcript_path: Path,
     max_wait_seconds: float = 1.5,
-    poll_interval_seconds: float = 0.3,
+    poll_interval_seconds: float = constants.TRANSCRIPT_POLL_INTERVAL,
 ) -> str:
     """Read assistant text, re-read until two consecutive reads agree.
 
