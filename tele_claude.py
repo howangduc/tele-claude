@@ -1147,8 +1147,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except ValueError:
             _ = await query.answer()
             return
+        # Claude's multi-select TUI says "Enter to select · Tab/Arrow keys
+        # to navigate" at the bottom. The digit alone JUMPS THE CURSOR to
+        # option N but doesn't toggle it — Enter does the toggle of the
+        # currently-focused option. So we need both keystrokes (in that
+        # order) for "tap option N in Telegram" to actually flip its
+        # checkbox in the TUI. Without the trailing Enter the user sees
+        # their tap silently lost while Claude's pre-selected default
+        # stays checked. Use ``_send_to_tmux`` here so the digit is sent
+        # in literal mode (avoiding any tmux key-name interpretation)
+        # and Enter is sent as a key event right after.
         try:
-            _send_key(pane_id, idx_str)  # digit keystroke = TUI toggle
+            _send_to_tmux(pane_id, idx_str)
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
             return
