@@ -40,6 +40,7 @@ from urllib.request import Request, urlopen
 
 import constants
 import tele_claude_format
+import tele_claude_questions
 import tele_claude_state as state
 
 
@@ -769,33 +770,9 @@ def _describe_tool_use(tool: dict[str, Any]) -> str | None:
         questions = inp.get("questions") or []
         if isinstance(questions, list) and questions:
             first = questions[0] if isinstance(questions[0], dict) else {}
-            q_text = str(first.get("question") or "").strip()
-            multi = first.get("multiSelect")
-            options = first.get("options") or []
-            suffix = " <i>(select all that apply)</i>" if multi else ""
-            lines: list[str] = []
-            if q_text:
-                lines.append(f"❓ <b>{esc(q_text)}</b>{suffix}")
-            else:
-                lines.append(f"❓ <b>Question needs an answer</b>{suffix}")
-            # Render each option with its description so the user can
-            # pick intelligently — the inline-keyboard buttons carry
-            # only the label + number.
-            if isinstance(options, list):
-                for idx, opt in enumerate(options, start=1):
-                    if isinstance(opt, dict):
-                        label = str(opt.get("label") or f"Option {idx}")
-                        desc = str(opt.get("description") or "").strip()
-                    elif isinstance(opt, str):
-                        label = opt
-                        desc = ""
-                    else:
-                        continue
-                    line = f"<b>{idx}. {esc(label, 120)}</b>"
-                    if desc:
-                        line += f"\n    <i>{esc(desc, 200)}</i>"
-                    lines.append(line)
-            return "\n\n".join(lines)
+            return tele_claude_questions.render_question_html(
+                first, idx=0, total=len(questions)
+            )
         return "❓ <b>Question needs an answer</b>"
     if name == "Write":
         path = inp.get("file_path") or "?"
@@ -863,55 +840,8 @@ def _build_permission_keyboard(
         questions = inp.get("questions") if isinstance(inp, dict) else None
         if isinstance(questions, list) and questions and isinstance(questions[0], dict):
             first = questions[0]
-            options = first.get("options")
-            is_multi = bool(first.get("multiSelect"))
-            if isinstance(options, list) and options:
-                n = min(len(options), 8)
-                if is_multi:
-                    # Compact labels (just "☐ N") — the full option text
-                    # already lives in the message body (rendered by
-                    # _permission_subject), so redrawing the keyboard on
-                    # every toggle stays small and fits Telegram's
-                    # 64-byte callback_data limit (mask up to 255).
-                    rows: list[list[dict[str, Any]]] = []
-                    for idx in range(1, n + 1):
-                        rows.append(
-                            [
-                                {
-                                    "text": f"☐ {idx}",
-                                    "callback_data": f"mtg:{pane_id}:{idx}:0",
-                                }
-                            ]
-                        )
-                    rows.append(
-                        [
-                            {
-                                "text": "✅ Submit",
-                                "callback_data": f"msub:{pane_id}",
-                            }
-                        ]
-                    )
-                    return {"inline_keyboard": rows}
-                # Single-select: one tap = immediate submission.
-                rows = []
-                for idx, opt in enumerate(options[:n], start=1):
-                    label = ""
-                    if isinstance(opt, dict):
-                        label = str(opt.get("label") or "")
-                    elif isinstance(opt, str):
-                        label = opt
-                    if not label:
-                        label = f"Option {idx}"
-                    if len(label) > 40:
-                        label = label[:37] + "…"
-                    rows.append(
-                        [
-                            {
-                                "text": f"{idx}. {label}",
-                                "callback_data": f"ans:{pane_id}:{idx}",
-                            }
-                        ]
-                    )
+            rows = tele_claude_questions.question_keyboard_rows(pane_id, first)
+            if rows:
                 return {"inline_keyboard": rows}
 
     if tool and tool.get("name") == "ExitPlanMode":
@@ -1210,6 +1140,41 @@ def main_notify() -> None:
     elif notif_type == "idle_prompt":
         _set_pane_title(pane_id, "💤 idle")
         topic_title = "💤 idle"
+
+    # Multi-question AskUserQuestion: cache the FULL questions list so
+    # the bot can render Q2…QN as the user answers each one (Claude
+    # Code only fires Notification once at the start of the tool call,
+    # so the bot is on its own from there). Single-question dialogs
+    # don't need this — clear any stale state from previous calls so
+    # we never replay a dead chain.
+    forum_chat_for_state = _forum_chat_id()
+    if (
+        pane_id
+        and notif_type == "permission_prompt"
+        and pending_tool
+        and pending_tool.get("name") == "AskUserQuestion"
+    ):
+        questions = (
+            (pending_tool.get("input") or {}).get("questions")
+            if isinstance(pending_tool.get("input"), dict)
+            else None
+        )
+        if isinstance(questions, list) and len(questions) > 1:
+            state.set_pending_questions(
+                pane_id,
+                {
+                    "questions": questions,
+                    "current_idx": 0,
+                    "total": len(questions),
+                    # ``thread_id`` is per-chat and we may fan out to
+                    # multiple chats below; the bot will resolve its
+                    # own thread_id via state.get_topic when it sends
+                    # the next question, so we just record forum chat.
+                    "forum_chat_id": forum_chat_for_state,
+                },
+            )
+        else:
+            state.clear_pending_questions(pane_id)
 
     for chat_id in _hook_chat_ids():
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)

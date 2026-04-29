@@ -177,6 +177,19 @@ def prune_panes(alive_pane_ids: set[str]) -> tuple[set[str], set[str]]:
 
     if changed:
         _save(state)
+
+    # Wipe any pending-questions state for now-dead panes — kept out of
+    # the JSON state file (separate dir) so we sweep its files here.
+    pq_dir = _cache_root() / "pending_questions"
+    if pq_dir.exists():
+        for pq_file in pq_dir.glob("*.json"):
+            pane_from_file = pq_file.stem
+            if pane_from_file not in alive_pane_ids:
+                try:
+                    pq_file.unlink()
+                except OSError:
+                    pass
+
     return dead_subs, dead_muted
 
 
@@ -328,6 +341,119 @@ def should_rename_topic(pane_id: str, every_n_turns: int = 15) -> bool:
     except OSError:
         pass
     return fire
+
+
+# ---------- Pending multi-question AskUserQuestion state ----------
+#
+# When Claude calls ``AskUserQuestion`` with multiple questions, its
+# ``Notification`` hook only fires once at the start. After the user
+# answers question N in the TUI it auto-advances to N+1, but Telegram
+# has no signal — so we cache the full questions list here when notify
+# fires, and the bot's callback handlers consult it after each answer
+# to send the next question's UI as a fresh Telegram message.
+#
+# Stored per-pane as a small JSON file (not in state.json — separate
+# directory so the on-disk write footprint per turn is bounded). TTL
+# is enforced by the bot at read time so stale state from an aborted
+# dialog (Esc'd in tmux) doesn't haunt future Notifications.
+
+
+def _pending_questions_dir() -> Path:
+    path = _cache_root() / "pending_questions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pending_questions_file(pane_id: str) -> Path:
+    safe = pane_id.replace("/", "_").replace(":", "_")
+    return _pending_questions_dir() / f"{safe}.json"
+
+
+def set_pending_questions(pane_id: str, payload: dict[str, object]) -> None:
+    """Persist the full questions list + cursor for a pane.
+
+    ``payload`` shape: ``{"questions": [...], "current_idx": int,
+    "total": int, "thread_id": int|None, "chat_id": str}``. Includes a
+    ``stamped_at`` timestamp so callers can age-out stale entries.
+    """
+    path = _pending_questions_file(pane_id)
+    payload = {**payload, "stamped_at": time.time()}
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pq-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_pending_questions(
+    pane_id: str, max_age_seconds: float = constants.PENDING_QUESTIONS_TTL_SECONDS
+) -> dict[str, object] | None:
+    """Read pending questions; ignore + clean entries older than TTL."""
+    path = _pending_questions_file(pane_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stamped = data.get("stamped_at")
+    if isinstance(stamped, (int, float)):
+        if time.time() - float(stamped) > max_age_seconds:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+    return data
+
+
+def advance_pending_questions(pane_id: str) -> dict[str, object] | None:
+    """Increment ``current_idx``; return new state, or None if exhausted.
+
+    Returns None when (a) no pending state, (b) advancing past the last
+    question — caller treats this as "no more questions, finalize".
+    Auto-clears the file when exhausted so a stale entry doesn't trip
+    later TUIs for the same pane.
+    """
+    payload = get_pending_questions(pane_id)
+    if payload is None:
+        return None
+
+    def _to_int(v: object) -> int:
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            try:
+                return int(v)
+            except ValueError:
+                return 0
+        return 0
+
+    idx = _to_int(payload.get("current_idx"))
+    total = _to_int(payload.get("total"))
+    if total <= 0 or idx + 1 >= total:
+        clear_pending_questions(pane_id)
+        return None
+    payload["current_idx"] = idx + 1
+    set_pending_questions(pane_id, payload)
+    return payload
+
+
+def clear_pending_questions(pane_id: str) -> None:
+    try:
+        _pending_questions_file(pane_id).unlink()
+    except FileNotFoundError:
+        pass
 
 
 # ---------- Muted panes (global across chats) ----------

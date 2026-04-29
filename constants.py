@@ -89,9 +89,7 @@ PRE_MAX_WIDTH = 34
 # passed since the session's last real activity (UserPromptSubmit
 # or Stop). Claude Code's own idle_prompt fires at 60s (hardcoded
 # upstream — see anthropics/claude-code#13922).
-IDLE_SUPPRESS_SECONDS = float(
-    os.environ.get("TELE_CLAUDE_IDLE_MIN_SECONDS", "900")
-)
+IDLE_SUPPRESS_SECONDS = float(os.environ.get("TELE_CLAUDE_IDLE_MIN_SECONDS", "900"))
 
 # Forum-mode topic rename throttle: fire ``editForumTopic`` once
 # every Nth Stop hook (per-pane counter in state). 1 = every turn.
@@ -115,6 +113,15 @@ TRANSCRIPT_POLL_INTERVAL = 0.3
 HISTORY_DEFAULT_LINES = 20
 HISTORY_MAX_LINES = 500
 HISTORY_BODY_TRIM = 3500  # max chars before head-truncation
+
+# ---------- Multi-question AskUserQuestion ----------
+
+# How long pending-question state for a pane is considered fresh. If
+# the user dismisses a multi-question dialog inside tmux (Esc) or
+# answers it directly without using Telegram, we don't want the stale
+# cache to corrupt the next AskUserQuestion fired by the same pane.
+# 15 min is plenty for any normal answer flow.
+PENDING_QUESTIONS_TTL_SECONDS = 900
 
 # ---------- Filenames ----------
 

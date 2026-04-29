@@ -262,6 +262,8 @@ When Claude Code asks for permission, you get a 🔐 message with three buttons:
 
 No need to type — tap and go. (The digits match Claude Code's default permission UI.)
 
+**AskUserQuestion — multi-question chains.** Claude can ask **several questions in one tool call** (the TUI shows them as tabs: `Target store | Schema shape | SCD policy | Submit`). Telegram drives the flow sequentially: answer the first question, the bot fires the keystroke into the pane, the TUI advances to the next tab, and the bot sends a fresh message with `(N/M) ❓ <question>` plus its keyboard. Repeat until the last tab — then the bot offers `✅ Submit answers / ❌ Cancel` for the TUI's review screen. State is cached at `~/.cache/tele-claude/pending_questions/<pane>.json` for `TELE_CLAUDE_PENDING_QUESTIONS_TTL_SECONDS` (default 15 min) so a stale dialog doesn't haunt the next call. Single-question dialogs work as before — no extra messages.
+
 **AskUserQuestion — single vs multi-select.** When Claude calls `AskUserQuestion` with `multiSelect=false` (default), each declared option becomes its own button labelled `1. <option label>`; one tap submits that choice. When `multiSelect=true`, the keyboard switches to a **toggle → submit → confirm** three-stage layout that mirrors Claude's TUI:
 
 1. **Toggle stage.** Each option renders as a compact `☐ N` / `☑ N` button (full option text stays in the message body above), with a trailing `✅ Submit` button. Each toggle tap sends the matching digit keystroke — which Claude's TUI interprets as "flip this checkbox" — and the bot redraws the keyboard with the updated ☐/☑ glyphs so your phone mirrors the TUI state.

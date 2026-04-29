@@ -63,6 +63,7 @@ from telegram.ext import (
 )
 
 import constants
+import tele_claude_questions
 import tele_claude_state as state
 
 logging.basicConfig(level=logging.INFO)
@@ -231,7 +232,15 @@ def _send_to_tmux(pane_id: str, text: str) -> None:
             check=True,
         )
         _ = subprocess.run(
-            ["tmux", "paste-buffer", "-b", constants.TMUX_PASTE_BUFFER, "-t", pane_id, "-d"],
+            [
+                "tmux",
+                "paste-buffer",
+                "-b",
+                constants.TMUX_PASTE_BUFFER,
+                "-t",
+                pane_id,
+                "-d",
+            ],
             check=True,
         )
         time.sleep(constants.PASTE_SETTLE_DELAY)
@@ -941,7 +950,124 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Callback buttons ----------
 
 
-async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+def _coerce_int(value: object, default: int = 0) -> int:
+    """Best-effort ``int(value)`` for state-dict reads that come back as
+    ``object`` from JSON. Returns ``default`` on anything unparseable.
+    Centralises the cast so basedpyright doesn't complain at every site
+    that pulls ``current_idx`` / ``total`` out of a pending payload.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _rows_dict_to_markup(
+    rows: list[list[dict[str, Any]]],
+) -> InlineKeyboardMarkup:
+    """Convert ``tele_claude_questions``-style raw row dicts to a PTB
+    ``InlineKeyboardMarkup``. The helpers in that module return dicts so
+    they can be reused by the hook side (which serialises straight to
+    Telegram's HTTP API); the bot side wraps them into the typed PTB
+    objects here.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(b["text"], callback_data=b["callback_data"])
+                for b in row
+            ]
+            for row in rows
+        ]
+    )
+
+
+async def _send_next_question(
+    context: ContextTypes.DEFAULT_TYPE, message: Message, pane_id: str
+) -> bool:
+    """Advance the pending-questions cursor for ``pane_id`` and send Q[next]
+    as a fresh Telegram message in the same topic.
+
+    Returns ``True`` when a follow-up question was sent. Returns
+    ``False`` when no pending state exists, or the user just answered
+    the LAST question (caller treats False as "TUI is on the review
+    screen — emit the final Submit/Cancel keyboard").
+    """
+    payload = state.advance_pending_questions(pane_id)
+    if payload is None:
+        return False
+    questions = payload.get("questions") or []
+    try:
+        idx = _coerce_int(payload.get("current_idx"))
+        total = _coerce_int(payload.get("total"))
+    except (TypeError, ValueError):
+        state.clear_pending_questions(pane_id)
+        return False
+    if not isinstance(questions, list) or idx >= len(questions) or idx >= total:
+        state.clear_pending_questions(pane_id)
+        return False
+    next_q = questions[idx]
+    if not isinstance(next_q, dict):
+        return False
+    body = tele_claude_questions.render_question_html(next_q, idx, total)
+    rows_dict = tele_claude_questions.question_keyboard_rows(pane_id, next_q)
+    if not rows_dict:
+        return False
+    try:
+        _ = await context.bot.send_message(
+            chat_id=message.chat_id,
+            text=body,
+            parse_mode="HTML",
+            reply_markup=_rows_dict_to_markup(rows_dict),
+            message_thread_id=getattr(message, "message_thread_id", None),
+        )
+    except Exception:
+        logger.exception("send_next_question: failed to send Q[%d]", idx)
+        return False
+    return True
+
+
+async def _send_final_review_keyboard(
+    context: ContextTypes.DEFAULT_TYPE, message: Message, pane_id: str
+) -> None:
+    """Emit the post-questions ``✅ Submit answers / ❌ Cancel`` keyboard.
+
+    Used after the user has answered the LAST question of a multi-
+    question AskUserQuestion chain. Claude's TUI is then on its review
+    screen waiting for one more keystroke (digit ``1`` or ``2``) — this
+    surfaces those choices as a fresh Telegram message in the same
+    topic so the user never has to attach to tmux to finalise.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                "✅ Submit answers", callback_data=f"mfin:{pane_id}:1"
+            ),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"mfin:{pane_id}:2"),
+        ]
+    ]
+    try:
+        _ = await context.bot.send_message(
+            chat_id=message.chat_id,
+            text=(
+                f"📝 <b>Review your answers</b> for "
+                f"<code>{_html.escape(pane_id)}</code> · tap to finalise."
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+            message_thread_id=getattr(message, "message_thread_id", None),
+        )
+    except Exception:
+        logger.exception("send_final_review_keyboard failed")
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not isinstance(query.message, Message):
         return
@@ -966,21 +1092,40 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             return
         try:
             _send_to_tmux(pane_id, answer)
-            # Alert-style popup (needs a tap to dismiss) so the user gets
-            # unambiguous confirmation even if they miss the brief toast.
-            _ = await query.answer(f"✅ Sent {answer} → {pane_id}", show_alert=True)
-            # Drop the buttons so the message visually "commits" to the
-            # decision. We deliberately DON'T edit the body — the original
-            # message's HTML (plan, question text, preamble) is kept intact
-            # for scrollback. Editing the text risks re-parsing failures
-            # when the message contains nested tags or HTML-special chars,
-            # which manifests on the phone as "tap did nothing".
-            try:
-                _ = await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
+            return
+        # Alert-style popup (needs a tap to dismiss) so the user gets
+        # unambiguous confirmation even if they miss the brief toast.
+        _ = await query.answer(f"✅ Sent {answer} → {pane_id}", show_alert=True)
+        # Drop the buttons so the message visually "commits" to the
+        # decision. We deliberately DON'T edit the body — the original
+        # message's HTML (plan, question text, preamble) is kept intact
+        # for scrollback. Editing the text risks re-parsing failures
+        # when the message contains nested tags or HTML-special chars,
+        # which manifests on the phone as "tap did nothing".
+        try:
+            _ = await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        # Multi-question AskUserQuestion advance. No-op for permission
+        # prompts (Allow/Always/Deny), ExitPlanMode (Approve/Keep
+        # planning), and single-question dialogs — pending_questions
+        # state is only written by the hook for chains of length ≥ 2.
+        pending = state.get_pending_questions(pane_id)
+        if pending:
+            try:
+                idx = _coerce_int(pending.get("current_idx"))
+                total = _coerce_int(pending.get("total"))
+            except (TypeError, ValueError):
+                state.clear_pending_questions(pane_id)
+                return
+            if idx < total - 1:
+                _ = await _send_next_question(context, message, pane_id)
+            else:
+                # Last single-select answered → TUI advanced to review.
+                state.clear_pending_questions(pane_id)
+                await _send_final_review_keyboard(context, message, pane_id)
         return
 
     if data.startswith("mtg:"):
@@ -1041,11 +1186,12 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if data.startswith("msub:"):
-        # Multi-select "Submit" tap — advances the TUI from toggle mode to
-        # the "Review your answers / 1. Submit answers / 2. Cancel"
-        # screen. We don't finalize yet because the TUI still needs one
-        # more tap to confirm; swap the keyboard for that final pair so
-        # the user never has to type.
+        # Multi-select "Submit" tap. In a single-question dialog this
+        # advances the TUI from toggle mode to the "Review your answers
+        # / 1. Submit answers / 2. Cancel" screen. In a multi-question
+        # chain, the TUI instead jumps to the next question's tab — the
+        # bot then renders that next question and drops this message's
+        # keyboard so the user can't tap submit twice.
         pane_id = data[len("msub:") :]
         if not _pane_exists(pane_id):
             _ = await query.answer(f"{pane_id} gone", show_alert=True)
@@ -1055,6 +1201,26 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
             return
+        pending = state.get_pending_questions(pane_id)
+        idx = total = 0
+        if pending:
+            idx = _coerce_int(pending.get("current_idx"))
+            total = _coerce_int(pending.get("total"))
+        if pending and idx < total - 1:
+            # Not the last question — drop this kbd, send next.
+            try:
+                _ = await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            _ = await _send_next_question(context, message, pane_id)
+            _ = await query.answer(f"Q {idx + 1}/{total} submitted")
+            return
+        # Last question (or no pending) — TUI is on review screen.
+        # Swap THIS message's keyboard in place to the Submit/Cancel
+        # pair (preserves scroll position better than a fresh message
+        # for the common single-question case).
+        if pending:
+            state.clear_pending_questions(pane_id)
         finalise_rows: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton(
@@ -1100,6 +1266,10 @@ async def on_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             _ = await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
+        # Defensive: if pending state somehow survived (e.g. user
+        # manually navigated past the review screen in tmux), drop it
+        # so the next AskUserQuestion call starts fresh.
+        state.clear_pending_questions(pane_id)
         label = "Submitted" if choice == "1" else "Cancelled"
         _ = await query.answer(f"✅ {label} → {pane_id}", show_alert=True)
         return
