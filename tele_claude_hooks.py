@@ -871,6 +871,38 @@ def _build_permission_keyboard(
     }
 
 
+# ANSI SGR escape codes appear in `!` command output (e.g. `!ls --color`
+# or `!grep --color`). Stripping keeps the Telegram rendering clean —
+# Telegram doesn't render terminal colors and the raw escape sequences
+# read as garbage on phones.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI SGR escape codes and other CSI sequences."""
+    return _ANSI_RE.sub("", text)
+
+
+# Claude Code writes `!` shell command output as a user-role transcript
+# entry whose ``content`` is a string wrapped in this tag. Treating it
+# as a real user prompt would clear the assistant-text buffer (see
+# _last_assistant_text below); instead we extract the inner text and
+# append it as part of the turn's reply so it round-trips to Telegram.
+_LOCAL_STDOUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
+)
+
+
+def _extract_local_command_output(content: str) -> str | None:
+    """Return the inner stdout payload (ANSI-stripped), or None if the
+    string isn't a local-command-stdout envelope. Matches even when the
+    envelope is embedded in a longer string (defensive)."""
+    m = _LOCAL_STDOUT_RE.search(content)
+    if not m:
+        return None
+    return _strip_ansi(m.group(1))
+
+
 def _last_assistant_text(transcript_path: Path) -> str:
     """Return all assistant text from the most recent turn.
 
@@ -893,9 +925,35 @@ def _last_assistant_text(transcript_path: Path) -> str:
                 role = msg.get("role")
                 blocks = msg.get("content") or []
                 if role == "user":
+                    # `!` shell commands and slash commands write
+                    # user-role string-content entries. Skip the meta
+                    # caveat ("DO NOT respond to these"), surface the
+                    # stdout output as part of the turn's reply, and
+                    # ignore the bare command-name preamble (just an
+                    # echo of what the user typed).
+                    if entry.get("isMeta"):
+                        continue
+                    raw_content = msg.get("content")
+                    if isinstance(raw_content, str):
+                        stdout_body = _extract_local_command_output(raw_content)
+                        if stdout_body is not None:
+                            stripped = stdout_body.strip()
+                            if stripped:
+                                # Markdown fenced code block → renders
+                                # as <pre> via tele_claude_format.convert
+                                # in main_reply. Prefix with 🐚 so the
+                                # user can tell shell output apart from
+                                # the 🤖 assistant prefix on the header.
+                                texts.append(f"🐚\n```\n{stripped}\n```")
+                            continue
+                        # Bare <command-name>… preambles carry no
+                        # information beyond what the user just typed —
+                        # skip without clearing the buffer.
+                        if "<command-name>" in raw_content:
+                            continue
                     is_real_prompt = any(
                         isinstance(b, dict) and b.get("type") == "text" for b in blocks
-                    ) or (isinstance(msg.get("content"), str))
+                    ) or isinstance(raw_content, str)
                     if is_real_prompt:
                         texts.clear()
                     continue
