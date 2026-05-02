@@ -24,3 +24,13 @@ dev = [
     "basedpyright>=1.38.3",
     "ruff>=0.15.7",
 ]
+
+# Hatchling's auto-discovery for project name "tele-claude" picks exactly
+# one of `tele_claude.py` OR `tele_claude/` as the wheel target — sibling
+# `tele_claude_*.py` modules are NOT auto-included regardless of name.
+# Without this block the built wheel ships only tele_claude.py and every
+# install fails at import time with ModuleNotFoundError. Verified by
+# `python -m build --wheel && unzip -l dist/*.whl` before/after.
+[tool.hatch.build.targets.wheel]
+include = ["tele_claude*.py"]
+
