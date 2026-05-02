@@ -252,6 +252,66 @@ check this stack trace
 
 > **Albums (multiple photos or files in one send):** Telegram delivers each as its own message; the bot forwards them one by one in order.
 
+### Voice notes — speech-to-text dictation
+
+Hold the microphone button in Telegram and dictate. The bot transcribes the
+recording, shows you the transcript with **Send** / **Cancel** buttons, and only
+forwards to the active pane when you tap **Send**. Misheard identifiers or
+commands never reach Claude silently.
+
+| Stage | What you see |
+|---|---|
+| Voice note delivered | Voice note in chat as usual |
+| Bot transcribes | `🎤 Transcript (%PANE):` `<text>` with `[✅ Send]` `[❌ Cancel]` |
+| Tap `✅ Send` | Card edits to `✅ Sent to %PANE`; transcript reaches Claude exactly like a typed message |
+| Tap `❌ Cancel` | Card edits to `❌ Cancelled`; pane untouched; cached audio deleted |
+| STT failure | Card reads `❌ STT failed: <reason>` with `[🔁 Retry]` `[🔁 Try other provider]` — retry hits the same provider, swap flips between `elevenlabs` and `selfhost` |
+| You walk away | After 15 min the next tap shows `⌛ expired`, no buttons |
+
+**Architecture.** Speech-to-text is split into a port + adapters
+(`tele_claude_speech.py`):
+- `SpeechToTextPort` — abstract interface (`async transcribe(path) -> str`)
+- `ElevenLabsAdapter` — POSTs to ElevenLabs Scribe (`scribe_v1`)
+- `SelfHostedAdapter` — stub; raises `NotImplementedError` until the
+  self-hosted API docs are wired in
+
+The factory picks the active adapter from env at request time, so changing
+provider doesn't need a restart.
+
+**Setup.** Add to `~/.config/tele-claude/env`:
+
+```bash
+# Provider selection (default: elevenlabs)
+export TELE_CLAUDE_STT_PROVIDER=elevenlabs   # or 'selfhost'
+
+# Provider API key. Required for elevenlabs; ignored by the selfhost stub
+# (it raises NotImplementedError regardless).
+export TELE_CLAUDE_STT_API_KEY=sk_...
+
+# Self-hosted only. Unset for elevenlabs.
+# export TELE_CLAUDE_STT_BASE_URL=https://my-stt.internal/v1
+
+# How long an unconfirmed transcript stays clickable. Default 900s (15 min).
+# export TELE_CLAUDE_STT_PENDING_TTL_SECONDS=900
+
+# Cache directory for downloaded .ogg files (defaults under STATE_DIR).
+# export TELE_CLAUDE_VOICE_DIR=/path/to/voice
+```
+
+Get an ElevenLabs key from <https://elevenlabs.io/app/settings/api-keys>. Scribe
+is a paid feature on most plans — confirm pricing before turning the bot loose
+on hours of audio.
+
+**Caveats:**
+- **Voice notes only** — `.mp3` / `.m4a` audio uploads are not transcribed (they
+  fall through unhandled, like before). Easy to extend if you want it.
+- **No streaming** — transcription happens once per voice note. ElevenLabs has
+  separate realtime endpoints; not wired up here.
+- **Retry uses the cached .ogg** — the audio sticks around until you tap Send,
+  Cancel, or the TTL expires. Stale audio is swept on bot startup.
+- **Self-hosted is a stub.** Setting `TELE_CLAUDE_STT_PROVIDER=selfhost` returns
+  `NotImplementedError` for every voice note until a real impl lands.
+
 ### Permission prompts from your phone
 
 When Claude Code asks for permission, you get a 🔐 message with three buttons:

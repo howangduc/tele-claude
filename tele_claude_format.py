@@ -23,7 +23,7 @@ import html
 import re
 import sys
 
-import constants
+import tele_claude_constants as constants
 
 _CODE_PLACEHOLDER = "\x00C{}\x00"
 _INLINE_PLACEHOLDER = "\x00I{}\x00"

@@ -25,6 +25,9 @@ Callback handlers (from inline keyboards placed by hooks or by /panes):
   mfin:%N:1|2     — final step of multi-select: 1=Submit answers, 2=Cancel (digit + Enter on the TUI's review prompt).
   qr:%N:<text>    — quick-reply text to a pane.
   cancel:%N       — send Ctrl-C to a pane.
+  voice:send|cancel|retry|swap — speech-to-text confirm card actions
+    (key derived from the bot reply's chat+message id; transcript +
+    target pane + audio path are loaded from the pending-voice cache).
 
 Fallback for plain-text messages: resolve pane from a reply-to `%N`,
 otherwise the active pane for that chat. Replies to "Args for /cmd?"
@@ -62,8 +65,9 @@ from telegram.ext import (
     filters,
 )
 
-import constants
+import tele_claude_constants as constants
 import tele_claude_questions
+import tele_claude_speech as speech
 import tele_claude_state as state
 
 logging.basicConfig(level=logging.INFO)
@@ -77,9 +81,10 @@ CHAT_IDS: frozenset[int] = frozenset(
 )
 
 # Inbound media destinations live in ``constants`` (env-overridable
-# via TELE_CLAUDE_IMAGE_DIR / TELE_CLAUDE_FILE_DIR).
+# via TELE_CLAUDE_IMAGE_DIR / TELE_CLAUDE_FILE_DIR / TELE_CLAUDE_VOICE_DIR).
 IMAGE_DIR = constants.IMAGE_DIR
 FILE_DIR = constants.FILE_DIR
+VOICE_DIR = constants.VOICE_DIR
 
 # Filenames coming from Telegram may contain path separators or shell
 # metacharacters — neutralise before we write to disk. Keeps letters,
@@ -1312,6 +1317,142 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ = await query.answer(f"Failed: {e}", show_alert=True)
         return
 
+    if data.startswith("voice:"):
+        # Voice STT confirm/cancel/retry/swap. Pending state is keyed by
+        # (chat_id, message_id) of the bot's reply (the card the buttons
+        # are attached to) — derived from query.message, so callback_data
+        # stays short.
+        #
+        # IMPORTANT: ``query.answer()`` MUST be called within ~15 s of the
+        # tap or Telegram returns "Query is too old" and the user's
+        # spinner never clears (looks like the button did nothing). So
+        # in every branch we answer EARLY, before the slow work
+        # (tmux subprocess, network edits, STT API calls).
+        action = data[len("voice:") :]
+        chat_id = message.chat_id
+        msg_id = message.message_id
+        pending = state.get_pending_voice(chat_id, msg_id)
+        if pending is None:
+            _ = await query.answer("Expired")
+            try:
+                _ = await query.edit_message_text(
+                    "⌛ expired", reply_markup=None
+                )
+            except Exception:
+                pass
+            return
+
+        pane_id = str(pending.get("target_pane") or "")
+        audio_path_str = str(pending.get("audio_path") or "")
+        transcript_obj = pending.get("transcript")
+        provider = str(
+            pending.get("provider") or constants.STT_PROVIDER_DEFAULT
+        )
+
+        if action == "send":
+            if not isinstance(transcript_obj, str) or not transcript_obj:
+                _ = await query.answer("No transcript yet", show_alert=True)
+                return
+            if not _pane_exists(pane_id):
+                _ = await query.answer(f"{pane_id} gone", show_alert=True)
+                return
+            try:
+                _send_to_tmux(pane_id, transcript_obj)
+            except subprocess.CalledProcessError as e:
+                _ = await query.answer(f"Failed: {e}", show_alert=True)
+                return
+            # Tmux send already succeeded — answer the spinner NOW so
+            # the user gets immediate feedback even if the message edit
+            # is slow. Cleanup work follows.
+            _ = await query.answer(f"✅ Sent → {pane_id}")
+            try:
+                _ = await query.edit_message_text(
+                    f"✅ Sent to {_html.escape(pane_id)}",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            state.clear_pending_voice(chat_id, msg_id)
+            try:
+                Path(audio_path_str).unlink()
+            except OSError:
+                pass
+            return
+
+        if action == "cancel":
+            _ = await query.answer("Cancelled")
+            try:
+                _ = await query.edit_message_text(
+                    "❌ Cancelled", reply_markup=None
+                )
+            except Exception:
+                pass
+            state.clear_pending_voice(chat_id, msg_id)
+            try:
+                Path(audio_path_str).unlink()
+            except OSError:
+                pass
+            return
+
+        if action in {"retry", "swap"}:
+            next_provider = (
+                speech.other_provider(provider) if action == "swap" else provider
+            )
+            try:
+                port = speech.get_stt_port(next_provider)
+            except ValueError as e:
+                _ = await query.answer("Misconfigured", show_alert=True)
+                try:
+                    _ = await query.edit_message_text(
+                        f"❌ STT misconfigured: {e}", reply_markup=None
+                    )
+                except Exception:
+                    pass
+                return
+
+            # STT call may take several seconds — answer the spinner
+            # now (with a toast) so the keyboard goes back to interactive
+            # while we wait for the provider's response.
+            _ = await query.answer("Transcribing…")
+            logger.info(
+                "STT %s (%s) → pane %s: %s",
+                action,
+                next_provider,
+                pane_id,
+                audio_path_str,
+            )
+            try:
+                new_transcript = await port.transcribe(Path(audio_path_str))
+            except (speech.TranscriptionError, NotImplementedError) as e:
+                pending["provider"] = next_provider
+                state.set_pending_voice(chat_id, msg_id, pending)
+                try:
+                    _ = await query.edit_message_text(
+                        f"❌ STT failed: {e}",
+                        reply_markup=_voice_error_keyboard(),
+                    )
+                except Exception:
+                    pass
+                return
+
+            pending["provider"] = next_provider
+            pending["transcript"] = new_transcript
+            state.set_pending_voice(chat_id, msg_id, pending)
+            try:
+                _ = await query.edit_message_text(
+                    _voice_confirm_body(pane_id, new_transcript),
+                    parse_mode="HTML",
+                    reply_markup=_voice_confirm_keyboard(),
+                )
+            except Exception:
+                pass
+            return
+
+        # Unknown voice:* action — just dismiss the spinner.
+        _ = await query.answer()
+        return
+
     _ = await query.answer()
 
 
@@ -1584,6 +1725,144 @@ async def on_attachment(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
 on_photo = on_attachment
 
 
+# ---------- Voice notes (speech-to-text) ----------
+
+
+def _voice_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Send / Cancel buttons shown on a successful transcription."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Send", callback_data="voice:send"),
+                InlineKeyboardButton("❌ Cancel", callback_data="voice:cancel"),
+            ]
+        ]
+    )
+
+
+def _voice_error_keyboard() -> InlineKeyboardMarkup:
+    """Retry / Try-other-provider buttons shown on STT failure."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔁 Retry", callback_data="voice:retry"),
+                InlineKeyboardButton(
+                    "🔁 Try other provider", callback_data="voice:swap"
+                ),
+            ]
+        ]
+    )
+
+
+def _voice_confirm_body(pane_id: str, transcript: str) -> str:
+    """HTML body for the success confirm card."""
+    return (
+        f"🎤 <b>Transcript ({_html.escape(pane_id)})</b>:\n"
+        f"<code>{_html.escape(transcript)}</code>"
+    )
+
+
+async def on_voice(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Transcribe a voice note and ask the user to confirm before forwarding.
+
+    Flow:
+      1. Auth + pane resolution (forum topic → pane, else active pane).
+      2. Download .ogg into ``VOICE_DIR`` so the retry/swap buttons can
+         re-run STT against the same file later.
+      3. Run the active STT adapter; render success → confirm card or
+         failure → error card with retry/swap buttons. Either way,
+         persist a pending-voice file keyed by the bot's reply id so
+         the callback handlers find context on tap.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    voice = message.voice
+    if not voice:
+        return
+
+    pane_id = _resolve_pane(message.chat_id, message)
+    if not pane_id:
+        _ = await message.reply_text(
+            "No active pane. Use /panes to pick one, or reply to a pane message."
+        )
+        return
+    if not _pane_exists(pane_id):
+        _ = await message.reply_text(
+            f"Pane {pane_id} no longer exists. /panes to pick a live one."
+        )
+        return
+
+    # Download the .ogg. Mirrors the IMAGE_DIR / FILE_DIR pattern so the
+    # filename includes both message_id (collision safety) and Telegram's
+    # file_unique_id (idempotency on re-delivery).
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    audio_path = (
+        VOICE_DIR / f"tg_{message.message_id}_{voice.file_unique_id}.ogg"
+    )
+    tg_file = await voice.get_file()
+    _ = await tg_file.download_to_drive(str(audio_path))
+
+    # Show an interim placeholder right away. STT can take several seconds;
+    # a silent gap reads as "bot broken" on phones. We edit this same
+    # message into the confirm card or the error card below — one chat
+    # bubble per voice note instead of two.
+    placeholder = await message.reply_text("🎤 Transcribing…")
+
+    provider = (
+        os.environ.get("TELE_CLAUDE_STT_PROVIDER", constants.STT_PROVIDER_DEFAULT)
+    ).lower()
+
+    # Misconfiguration is a startup-class error: no retry buttons would
+    # help (retry hits the same broken config). Bail by morphing the
+    # placeholder into a plain error message.
+    try:
+        port = speech.get_stt_port(provider)
+    except ValueError as e:
+        _ = await placeholder.edit_text(f"❌ STT misconfigured: {e}")
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+        return
+
+    logger.info("STT (%s) → pane %s: %s", provider, pane_id, audio_path)
+    try:
+        transcript = await port.transcribe(audio_path)
+    except (speech.TranscriptionError, NotImplementedError) as e:
+        _ = await placeholder.edit_text(
+            f"❌ STT failed: {e}",
+            reply_markup=_voice_error_keyboard(),
+        )
+        state.set_pending_voice(
+            placeholder.chat_id,
+            placeholder.message_id,
+            {
+                "audio_path": str(audio_path),
+                "target_pane": pane_id,
+                "provider": provider,
+                "transcript": None,
+            },
+        )
+        return
+
+    _ = await placeholder.edit_text(
+        _voice_confirm_body(pane_id, transcript),
+        parse_mode="HTML",
+        reply_markup=_voice_confirm_keyboard(),
+    )
+    state.set_pending_voice(
+        placeholder.chat_id,
+        placeholder.message_id,
+        {
+            "audio_path": str(audio_path),
+            "target_pane": pane_id,
+            "provider": provider,
+            "transcript": transcript,
+        },
+    )
+
+
 async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
@@ -1732,15 +2011,26 @@ _register_menu = _publish_menu  # back-compat alias kept for existing call sites
 
 
 def main() -> None:
+    # Sweep stale pending-voice entries (and their cached audio) so a
+    # crash mid-confirm doesn't leak forever. Cheap directory scan; runs
+    # once at startup before polling begins.
+    try:
+        swept = state.sweep_expired_pending_voice()
+        if swept:
+            logger.info("Swept %d expired pending-voice entries on startup", swept)
+    except Exception:
+        logger.exception("Startup sweep of pending-voice failed (non-fatal)")
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_publish_menu).build()
     for name, _desc, handler in _COMMANDS:
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback))
     # Accept photos + any document (txt, md, pdf, code, logs, zips, …).
     # Explicitly NOT filters.ATTACHMENT because that would also forward
-    # videos + audio + voice notes, which Claude can't do much with.
-    # Dispatched to ``on_attachment`` which branches on type internally.
+    # videos + audio (other than voice notes), which Claude can't do
+    # much with. Voice notes get their own handler (STT → confirm → forward).
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.COMMAND, on_slash_passthrough))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     logger.info("Bot started, polling...")

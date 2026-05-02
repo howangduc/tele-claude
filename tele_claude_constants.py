@@ -123,6 +123,21 @@ HISTORY_BODY_TRIM = 3500  # max chars before head-truncation
 # 15 min is plenty for any normal answer flow.
 PENDING_QUESTIONS_TTL_SECONDS = 900
 
+# ---------- Speech-to-text ----------
+
+# Provider name resolved from env (``elevenlabs`` or ``selfhost``).
+# The factory in ``tele_claude_speech.py`` reads this with the same
+# default; this constant lets unrelated code (e.g. logs, status
+# command) see the active provider without re-reading the env.
+STT_PROVIDER_DEFAULT = "elevenlabs"
+
+# How long an unconfirmed transcript stays in the pending cache before
+# the next interaction sees it as expired (and edits the card to
+# ``⌛ expired`` with no buttons). Mirrors the pending-questions TTL.
+PENDING_VOICE_TTL_SECONDS = int(
+    os.environ.get("TELE_CLAUDE_STT_PENDING_TTL_SECONDS", "900")
+)
+
 # ---------- Filenames ----------
 
 # Hard cap on the disk-side filename component (most filesystems
@@ -146,6 +161,13 @@ IMAGE_DIR: Path = Path(
 )
 FILE_DIR: Path = Path(
     os.environ.get("TELE_CLAUDE_FILE_DIR") or str(_default_state_dir() / "files")
+)
+# Voice-note audio files (.ogg) cached on download so the "Retry" /
+# "Try other provider" buttons can re-run STT against the same audio
+# without asking Telegram for the file again. Override via
+# TELE_CLAUDE_VOICE_DIR (rare — kept for symmetry with IMAGE_DIR).
+VOICE_DIR: Path = Path(
+    os.environ.get("TELE_CLAUDE_VOICE_DIR") or str(_default_state_dir() / "voice")
 )
 
 

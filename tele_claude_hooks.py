@@ -38,7 +38,7 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
-import constants
+import tele_claude_constants as constants
 import tele_claude_format
 import tele_claude_questions
 import tele_claude_state as state

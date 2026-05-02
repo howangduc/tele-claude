@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import constants
+import tele_claude_constants as constants
 
 
 def _cache_root() -> Path:
@@ -454,6 +454,127 @@ def clear_pending_questions(pane_id: str) -> None:
         _pending_questions_file(pane_id).unlink()
     except FileNotFoundError:
         pass
+
+
+# ---------- Pending voice transcripts (confirm-then-forward) ----------
+#
+# When a voice note is transcribed we hold {audio_path, transcript,
+# target_pane, provider} on disk so the Send / Cancel / Retry / Swap
+# callbacks can re-resolve the same context — across bot restarts and
+# across long delays before the user taps. Keyed by (chat_id, message_id)
+# of the *bot's reply* (the confirm card), since that's the message
+# the inline keyboard is attached to.
+
+
+def _pending_voice_dir() -> Path:
+    path = _cache_root() / "pending_voice"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pending_voice_file(chat_id: int, message_id: int) -> Path:
+    return _pending_voice_dir() / f"{chat_id}_{message_id}.json"
+
+
+def set_pending_voice(
+    chat_id: int, message_id: int, payload: dict[str, object]
+) -> None:
+    """Persist pending-voice state for a confirm card.
+
+    ``payload`` shape: ``{"audio_path": str, "target_pane": str,
+    "provider": str, "transcript": str|None}``. A ``stamped_at``
+    timestamp is added so callers can age-out stale entries.
+    """
+    path = _pending_voice_file(chat_id, message_id)
+    payload = {**payload, "stamped_at": time.time()}
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pv-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_pending_voice(
+    chat_id: int,
+    message_id: int,
+    max_age_seconds: float = constants.PENDING_VOICE_TTL_SECONDS,
+) -> dict[str, object] | None:
+    """Read pending-voice state; ignore + clean entries older than TTL."""
+    path = _pending_voice_file(chat_id, message_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stamped = data.get("stamped_at")
+    if isinstance(stamped, (int, float)):
+        if time.time() - float(stamped) > max_age_seconds:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+    return data
+
+
+def clear_pending_voice(chat_id: int, message_id: int) -> None:
+    try:
+        _pending_voice_file(chat_id, message_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def sweep_expired_pending_voice(
+    max_age_seconds: float = constants.PENDING_VOICE_TTL_SECONDS,
+) -> int:
+    """Drop expired pending-voice entries + their cached audio files.
+
+    Returns count swept. Called on bot startup so the cache directory
+    doesn't accrete forever (audio + JSON) when a user records voice
+    notes without confirming.
+    """
+    pv_dir = _cache_root() / "pending_voice"
+    if not pv_dir.exists():
+        return 0
+    now = time.time()
+    swept = 0
+    for entry in pv_dir.glob("*.json"):
+        try:
+            data = json.loads(entry.read_text())
+        except (OSError, json.JSONDecodeError):
+            try:
+                entry.unlink()
+                swept += 1
+            except OSError:
+                pass
+            continue
+        stamped = data.get("stamped_at") if isinstance(data, dict) else None
+        if not isinstance(stamped, (int, float)):
+            continue
+        if now - float(stamped) <= max_age_seconds:
+            continue
+        # Expired: delete the JSON and (if present) the cached .ogg.
+        audio = data.get("audio_path") if isinstance(data, dict) else None
+        if isinstance(audio, str):
+            try:
+                Path(audio).unlink()
+            except OSError:
+                pass
+        try:
+            entry.unlink()
+            swept += 1
+        except OSError:
+            pass
+    return swept
 
 
 # ---------- Muted panes (global across chats) ----------
