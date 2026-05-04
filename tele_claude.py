@@ -633,7 +633,39 @@ def _pick_session_name(cwd: str) -> str:
     return candidate
 
 
-async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
+def _wait_for_claude_ready(
+    pane_id: str, max_wait_seconds: float = 6.0, poll_seconds: float = 0.3
+) -> bool:
+    """Poll the pane until Claude Code's idle prompt (``❯``) appears.
+
+    Claude's TUI eats keystrokes that arrive during banner draw / TTY
+    init — so a fresh ``/new`` whose user types immediately loses the
+    first message (issue #11). This blocks the spawn handler briefly
+    until the prompt char is visible, then returns True. Timeout
+    returns False — caller decides whether to warn the user.
+    """
+    deadline = time.monotonic() + max_wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            out = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-5"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        except subprocess.CalledProcessError:
+            return False
+        if "❯" in out:
+            return True
+        time.sleep(poll_seconds)
+    return False
+
+
+async def _spawn_new_pane(
+    message: Message,
+    cwd_arg: str,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
     """Spawn a fresh detached tmux session running ``constants.LAUNCH_CMD`` and subscribe it.
 
     Each ``/new`` gets its own session (not just a window) so concurrent
@@ -642,6 +674,12 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
     client to a new window. The new session is detached so the user's
     attached terminal keeps doing whatever it was doing; they
     ``tmux attach -t <name>`` when they want to see it directly.
+
+    When ``context`` is provided AND forum mode is active, also creates
+    the pane's topic and posts the spawn confirmation INTO that topic
+    so the user lands directly in the chat thread for the new pane
+    (issue #11). Without ``context`` the legacy single-thread reply
+    path is used.
     """
     logger.info("cmd_new: spawning new session, cwd_arg=%r", cwd_arg)
     cwd = os.path.expanduser(cwd_arg) if cwd_arg else os.path.expanduser("~")
@@ -705,14 +743,40 @@ async def _spawn_new_pane(message: Message, cwd_arg: str) -> None:
     state.subscribe_pane(new_pane)
     state.set_active_pane(message.chat_id, new_pane)
 
+    # Wait for Claude TUI to finish init before declaring success.
+    # Without this, the user's first message in the new topic races
+    # against Claude's banner draw and gets eaten (issue #11).
+    ready = _wait_for_claude_ready(new_pane)
+
+    # Create the forum topic up-front so the user has somewhere to
+    # land. Without this, /new only writes a chat-level confirmation
+    # and the user must run /panes manually to materialise the topic.
+    thread_id: int | None = None
+    if context is not None:
+        thread_id = await _ensure_topic_for_pane(
+            context.application, new_pane, pane_title="🚀 starting", cwd=cwd
+        )
+
     short_cwd = cwd.replace(os.path.expanduser("~"), "~")
-    _ = await message.reply_text(
+    ready_line = (
+        "🟢 <i>Claude is ready — chat away.</i>"
+        if ready
+        else "⏳ <i>Still booting — give it a few seconds before chatting.</i>"
+    )
+    body = (
         f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
         f"<code>{_html.escape(short_cwd)}</code>\n"
         f"New session <code>{_html.escape(session_name)}</code> (detached) · "
         f"Launched <code>{_html.escape(constants.LAUNCH_CMD)}</code> · active + subscribed 🔔\n"
-        f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>",
-        parse_mode="HTML",
+        f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>\n"
+        f"{ready_line}"
+    )
+    # Send INTO the new topic when we created one. Telegram opens this
+    # topic on tap, so the user lands directly in the chat thread for
+    # the pane they just spawned. Falls back to legacy single-thread
+    # reply when forum mode is off / context not threaded through.
+    _ = await message.reply_text(
+        body, parse_mode="HTML", message_thread_id=thread_id
     )
 
 
@@ -734,7 +798,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = list(context.args or [])
     logger.info("cmd_new invoked, args=%r", args)
     if args:
-        await _spawn_new_pane(message, args[0])
+        await _spawn_new_pane(message, args[0], context)
         return
     logger.info("cmd_new: bare invocation, sending ForceReply prompt")
     _ = await message.reply_text(
@@ -2064,7 +2128,7 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
             raw_args = (message.text or "").strip()
             args = "" if raw_args.lower() in _SKIP_ARGS_TOKENS else raw_args
             if canonical == "new":
-                await _spawn_new_pane(message, args)
+                await _spawn_new_pane(message, args, _context)
                 return
             if canonical == "get":
                 await _send_file_to_user(message, args)
