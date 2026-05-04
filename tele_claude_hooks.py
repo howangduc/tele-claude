@@ -706,6 +706,36 @@ def _find_last_tool_use(transcript_path: Path) -> dict[str, Any] | None:
     return tool
 
 
+def _wait_for_pending_context(
+    transcript_path: Path,
+    max_wait_seconds: float = 1.5,
+    poll_interval_seconds: float = constants.TRANSCRIPT_POLL_INTERVAL,
+) -> tuple[dict[str, Any] | None, str]:
+    """Poll ``_find_pending_context`` until a tool_use entry appears.
+
+    The Notification hook can fire BEFORE Claude Code finishes flushing
+    the matching ``tool_use`` JSONL line — a real race confirmed against
+    a multi-question AskUserQuestion repro (issue #8). A single-shot read
+    in that window returns ``(None, "")`` and downstream rendering falls
+    back to the generic ``Allow / Always / Deny`` keyboard, which is
+    exactly the symptom users report.
+
+    Mirrors ``_wait_for_stable_text``'s shape: short bounded poll, tiny
+    sleep between reads, returns whatever the LAST read produced (so a
+    persistent-None case still bails fast at the deadline).
+    """
+    tool, ctx = _find_pending_context(transcript_path)
+    if tool is not None:
+        return tool, ctx
+    deadline = time.monotonic() + max_wait_seconds
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval_seconds)
+        tool, ctx = _find_pending_context(transcript_path)
+        if tool is not None:
+            return tool, ctx
+    return None, ""
+
+
 def _describe_tool_use(tool: dict[str, Any]) -> str | None:
     """Render a tool_use block as a Telegram HTML snippet.
 
@@ -1221,7 +1251,18 @@ def main_notify() -> None:
     if notif_type in ("permission_prompt", "elicitation_dialog") and transcript_raw:
         path = Path(str(transcript_raw))
         if path.exists():
-            pending_tool, pending_context = _find_pending_context(path)
+            # Wait briefly for Claude Code to flush the matching tool_use
+            # entry — see _wait_for_pending_context docstring + issue #8.
+            pending_tool, pending_context = _wait_for_pending_context(path)
+            if pending_tool is None:
+                # Race window timed out (or no tool_use present). Log
+                # for triage so future "nothing in Telegram" reports
+                # have a breadcrumb.
+                _log_api_error(
+                    "notify_no_pending_tool",
+                    {"text": f"notif_type={notif_type!r} pane={pane_id!r}"},
+                    "tool_use entry never appeared within wait window",
+                )
 
     body_parts: list[str] = []
     if msg_text:
