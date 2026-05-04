@@ -883,14 +883,23 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-# Claude Code writes `!` shell command output as a user-role transcript
-# entry whose ``content`` is a string wrapped in this tag. Treating it
-# as a real user prompt would clear the assistant-text buffer (see
-# _last_assistant_text below); instead we extract the inner text and
-# append it as part of the turn's reply so it round-trips to Telegram.
+# Claude Code writes user-typed local commands into the transcript as
+# user-role string-content entries with one of these envelope shapes:
+#   `!ls`     →  <bash-input>ls</bash-input>
+#                <bash-stdout>...</bash-stdout>
+#                <bash-stderr>...</bash-stderr>
+#   `/exit`   →  <command-name>/exit</command-name> ...
+#                <local-command-stdout>...</local-command-stdout>
+# Treating these as a real user prompt would clear the assistant-text
+# buffer (see _last_assistant_text below); instead we extract the inner
+# payload and append it as part of the turn's reply so it round-trips
+# to Telegram.
 _LOCAL_STDOUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
 )
+_BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
+_BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
+_BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
 
 
 def _extract_local_command_output(content: str) -> str | None:
@@ -901,6 +910,51 @@ def _extract_local_command_output(content: str) -> str | None:
     if not m:
         return None
     return _strip_ansi(m.group(1))
+
+
+def _bash_envelope_kind(content: str) -> str | None:
+    """Identify a bash-* envelope without extracting payloads.
+
+    Returns ``"input"`` if the entry carries the typed command,
+    ``"output"`` if it carries stdout/stderr (or both), ``None`` if the
+    entry isn't a bash-* envelope at all. Two transcript entries land
+    per `!cmd`: input first, then output — they must be combined into
+    one fenced block, see the state machine in ``_last_assistant_text``."""
+    if "<bash-input>" in content:
+        return "input"
+    if "<bash-stdout>" in content or "<bash-stderr>" in content:
+        return "output"
+    return None
+
+
+def _extract_bash_input(content: str) -> str:
+    m = _BASH_INPUT_RE.search(content)
+    return _strip_ansi(m.group(1)).strip() if m else ""
+
+
+def _extract_bash_output(content: str) -> tuple[str, str]:
+    """Return (stdout, stderr) — both ANSI-stripped + right-trimmed."""
+    out_m = _BASH_STDOUT_RE.search(content)
+    err_m = _BASH_STDERR_RE.search(content)
+    out = _strip_ansi(out_m.group(1)).rstrip() if out_m else ""
+    err = _strip_ansi(err_m.group(1)).rstrip() if err_m else ""
+    return out, err
+
+
+def _format_bash_block(cmd: str, stdout: str, stderr: str) -> str | None:
+    """Compose a 🐚 fenced block from cmd + stdout + stderr. Skip empty
+    sections (so `!cd /tmp` doesn't emit a noisy empty block). Returns
+    None if every section is empty."""
+    sections: list[str] = []
+    if cmd:
+        sections.append(f"$ {cmd}")
+    if stdout:
+        sections.append(stdout)
+    if stderr:
+        sections.append(f"[stderr]\n{stderr}")
+    if not sections:
+        return None
+    return "🐚\n```\n" + "\n".join(sections) + "\n```"
 
 
 def _last_assistant_text(transcript_path: Path) -> str:
@@ -925,30 +979,26 @@ def _last_assistant_text(transcript_path: Path) -> str:
                 role = msg.get("role")
                 blocks = msg.get("content") or []
                 if role == "user":
-                    # `!` shell commands and slash commands write
-                    # user-role string-content entries. Skip the meta
-                    # caveat ("DO NOT respond to these"), surface the
-                    # stdout output as part of the turn's reply, and
-                    # ignore the bare command-name preamble (just an
-                    # echo of what the user typed).
+                    # `!cmd` and `/slash` write user-role string-content
+                    # entries (<bash-input>/<bash-stdout> or
+                    # <command-name>/<local-command-stdout>). Note: the
+                    # Stop hook does NOT fire for these — Claude Code
+                    # processes them locally with no LLM turn — so this
+                    # branch never actually surfaces shell output to
+                    # Telegram. The bash-output forwarding lives in
+                    # tele_claude.on_message instead, triggered by the
+                    # `!` prefix in the user's Telegram message. We
+                    # still skip the envelope entries here so they
+                    # don't clobber the assistant-text buffer when a
+                    # later real reply does fire Stop.
                     if entry.get("isMeta"):
                         continue
                     raw_content = msg.get("content")
                     if isinstance(raw_content, str):
-                        stdout_body = _extract_local_command_output(raw_content)
-                        if stdout_body is not None:
-                            stripped = stdout_body.strip()
-                            if stripped:
-                                # Markdown fenced code block → renders
-                                # as <pre> via tele_claude_format.convert
-                                # in main_reply. Prefix with 🐚 so the
-                                # user can tell shell output apart from
-                                # the 🤖 assistant prefix on the header.
-                                texts.append(f"🐚\n```\n{stripped}\n```")
+                        if _bash_envelope_kind(raw_content) is not None:
                             continue
-                        # Bare <command-name>… preambles carry no
-                        # information beyond what the user just typed —
-                        # skip without clearing the buffer.
+                        if _LOCAL_STDOUT_RE.search(raw_content) is not None:
+                            continue
                         if "<command-name>" in raw_content:
                             continue
                     is_real_prompt = any(
@@ -1029,6 +1079,10 @@ def main_reply() -> None:
     transcript_path = Path(str(transcript_raw))
     if not transcript_path.exists():
         return
+    # Persist the pane → transcript mapping so non-hook code paths
+    # (e.g. on_message's `!cmd` forwarder) can find this pane's
+    # transcript without filesystem-scanning. Cheap idempotent write.
+    state.set_pane_transcript(pane_id, str(transcript_path))
     # Subscription gate — hooks only forward from panes the user has
     # interacted with via the bot. Panes with no TMUX_PANE at all are
     # allowed through (best-effort degradation for edge cases).
@@ -1283,9 +1337,16 @@ def main_progress() -> None:
     session_id = str(data.get("session_id") or "unknown")
     cwd = str(data.get("cwd") or "")
     prompt = str(data.get("prompt") or "")
+    transcript_raw = data.get("transcript_path")
     pane_id = os.environ.get("TMUX_PANE", "")
 
     state.touch_activity(session_id)
+    # Persist pane → transcript mapping early — the on_message `!cmd`
+    # forwarder needs it to find this pane's transcript without
+    # filesystem-scanning. UserPromptSubmit fires on every user turn
+    # so the mapping stays fresh.
+    if transcript_raw:
+        state.set_pane_transcript(pane_id, str(transcript_raw))
 
     if pane_id and not state.is_subscribed(pane_id):
         return

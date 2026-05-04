@@ -37,7 +37,9 @@ ForceReply prompts are dispatched back through the matching handler
 
 from __future__ import annotations
 
+import asyncio
 import html as _html
+import json
 import logging
 import os
 import re
@@ -1863,6 +1865,131 @@ async def on_voice(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ---------- `!cmd` bash-output forwarder ----------
+#
+# Background: Claude Code's `!`-prefix runs a shell command locally
+# (no LLM turn → no Stop, progress, notify, or post-tool-use hooks).
+# The bot's reply path is hook-driven, so `!cmd` output normally
+# never reaches Telegram. We compensate by intercepting the `!` prefix
+# in on_message: forward to the pane as usual (so Claude sees it),
+# then schedule a background task that polls the pane's transcript for
+# the matching <bash-input>/<bash-stdout> entries Claude Code writes
+# and replies to the user's message with the captured 🐚 block.
+
+_BANG_BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
+_BANG_BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
+_BANG_BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+_BANG_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_BANG_FORWARD_TIMEOUT_SECONDS = 5.0
+_BANG_FORWARD_POLL_INTERVAL = 0.4
+_BANG_FORWARD_MAX_BLOCK_CHARS = 3500
+
+
+def _read_bang_bash_block(transcript: Path, cmd: str) -> str | None:
+    """Find the most recent <bash-input>cmd</bash-input> in ``transcript``
+    and return a markdown-formatted ``$ cmd / stdout / [stderr]`` block.
+
+    Returns None if either entry hasn't been flushed yet (caller polls)
+    or if the entry has no useful content (e.g. ``!cd /tmp`` produces
+    empty stdout + empty stderr — skip the noise)."""
+    if not transcript.exists():
+        return None
+    try:
+        with transcript.open() as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    cmd_norm = cmd.strip()
+    input_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if "<bash-input>" not in lines[i]:
+            continue
+        try:
+            entry = json.loads(lines[i])
+        except json.JSONDecodeError:
+            continue
+        c = entry.get("message", {}).get("content")
+        if not isinstance(c, str):
+            continue
+        m = _BANG_BASH_INPUT_RE.search(c)
+        if m and m.group(1).strip() == cmd_norm:
+            input_idx = i
+            break
+    if input_idx is None:
+        return None
+    # Output entry usually lands within 1-2 entries after input. Bound
+    # the search so we don't tail the whole transcript on every miss.
+    for j in range(input_idx + 1, min(input_idx + 6, len(lines))):
+        if "<bash-stdout>" not in lines[j] and "<bash-stderr>" not in lines[j]:
+            continue
+        try:
+            entry = json.loads(lines[j])
+        except json.JSONDecodeError:
+            continue
+        c = entry.get("message", {}).get("content")
+        if not isinstance(c, str):
+            continue
+        out_m = _BANG_BASH_STDOUT_RE.search(c)
+        err_m = _BANG_BASH_STDERR_RE.search(c)
+        sections: list[str] = [f"$ {cmd_norm}"]
+        if out_m:
+            body = _BANG_ANSI_RE.sub("", out_m.group(1)).rstrip()
+            if body:
+                sections.append(body)
+        if err_m:
+            err_body = _BANG_ANSI_RE.sub("", err_m.group(1)).rstrip()
+            if err_body:
+                sections.append(f"[stderr]\n{err_body}")
+        if len(sections) == 1:
+            # Only the prompt — no actual output. `!cd /tmp` style.
+            return None
+        block = "\n".join(sections)
+        if len(block) > _BANG_FORWARD_MAX_BLOCK_CHARS:
+            block = block[: _BANG_FORWARD_MAX_BLOCK_CHARS - 3].rstrip() + "…"
+        return block
+    return None
+
+
+async def _forward_bang_output(
+    message: Message, pane_id: str, raw_text: str
+) -> None:
+    """Tail the pane's transcript for the matching bash entries Claude
+    Code wrote, then reply with a 🐚 fenced code block.
+
+    Bails silently if (a) the pane never had a hook fire (no
+    transcript mapping), (b) the transcript doesn't show the entry
+    within ``_BANG_FORWARD_TIMEOUT_SECONDS``, or (c) the cmd produced
+    no useful output.
+    """
+    cmd = raw_text[1:].lstrip()
+    if not cmd:
+        return
+    transcript_str = state.get_pane_transcript(pane_id)
+    if not transcript_str:
+        return
+    transcript = Path(transcript_str)
+
+    deadline = time.monotonic() + _BANG_FORWARD_TIMEOUT_SECONDS
+    block: str | None = None
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_BANG_FORWARD_POLL_INTERVAL)
+        block = _read_bang_bash_block(transcript, cmd)
+        if block is not None:
+            break
+    if not block:
+        return
+
+    body = f"🐚 <code>{_html.escape(pane_id)}</code>\n<pre>{_html.escape(block)}</pre>"
+    try:
+        _ = await message.reply_text(
+            body,
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+    except Exception:
+        logger.exception("Failed to forward bash output for %s", pane_id)
+
+
 async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
@@ -1910,6 +2037,15 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except subprocess.CalledProcessError as e:
         _ = await message.reply_text(f"Failed to send to pane {pane_id}: {e}")
+        return
+
+    # `!cmd` is Claude Code's bash escape — local execution, no LLM
+    # turn, no hooks fire. The hook-driven reply path therefore never
+    # surfaces the output to Telegram. Schedule a background poll of
+    # the pane's transcript to capture and forward whatever Claude
+    # Code wrote (matching <bash-input>/<bash-stdout> entries).
+    if text.startswith("!"):
+        _ = asyncio.create_task(_forward_bang_output(message, pane_id, text))
 
 
 # ---------- Entry ----------

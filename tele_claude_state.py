@@ -639,6 +639,51 @@ def clear_progress(key: str) -> None:
         pass
 
 
+# ---------- Pane → transcript mapping ----------
+#
+# Every Claude Code hook (Stop, progress, notify, post-tool-use, …)
+# arrives with both ``TMUX_PANE`` (env) and ``transcript_path`` (stdin).
+# We persist the mapping so non-hook code paths — specifically the
+# ``!``-prefix forwarder in ``tele_claude.on_message`` — can find which
+# transcript belongs to which pane without scanning the filesystem.
+#
+# Without this mapping the bash-output forwarder would have to guess
+# (e.g. most-recently-modified file under ~/.claude/projects/) which
+# races on multi-pane setups.
+
+
+def _pane_transcript_dir() -> Path:
+    path = _cache_root() / "pane_transcripts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pane_transcript_file(pane_id: str) -> Path:
+    safe = pane_id.replace("/", "_").replace(":", "_")
+    return _pane_transcript_dir() / f"{safe}.txt"
+
+
+def set_pane_transcript(pane_id: str, transcript_path: str) -> None:
+    """Record which transcript file Claude Code is writing for this pane."""
+    if not pane_id or not transcript_path:
+        return
+    try:
+        _pane_transcript_file(pane_id).write_text(transcript_path)
+    except OSError:
+        pass
+
+
+def get_pane_transcript(pane_id: str) -> str | None:
+    """Last transcript path the bot saw a hook fire for, for this pane."""
+    if not pane_id:
+        return None
+    path = _pane_transcript_file(pane_id)
+    try:
+        return path.read_text().strip() or None
+    except (OSError, FileNotFoundError):
+        return None
+
+
 # ---------- Claude command shortcuts ----------
 
 
