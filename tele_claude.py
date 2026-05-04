@@ -264,6 +264,63 @@ def _send_key(pane_id: str, key: str) -> None:
     state.subscribe_pane(pane_id)
 
 
+# Claude Code shows one of these spinner verbs (or "esc to interrupt")
+# while a turn is in flight. tmux capture-pane in that window contains
+# the spinner; an idle pane shows the empty `❯ ` prompt and the bottom
+# status bar without the spinner. We use this to gate `!cmd` forwards
+# in on_message — keystrokes that arrive mid-turn don't go through
+# Claude Code's `!`-REPL handler, so the bash output never lands in
+# the transcript and there's nothing for the forwarder to surface.
+_CLAUDE_BUSY_SIGNALS = (
+    "esc to interrupt",
+    "Beaming",
+    "Brewing",
+    "Cooking",
+    "Composing",
+    "Crafting",
+    "Crunching",
+    "Forging",
+    "Generating",
+    "Mulling",
+    "Noodling",
+    "Percolating",
+    "Pondering",
+    "Riffing",
+    "Simmering",
+    "Smelting",
+    "Spinning",
+    "Steaming",
+    "Stirring",
+    "Synthesizing",
+    "Thinking",
+    "Vibing",
+    "Weaving",
+    "Whipping",
+    "Working",
+    "Wrangling",
+)
+
+
+def _pane_is_busy(pane_id: str) -> bool:
+    """Heuristic: is Claude Code mid-turn in this pane?
+
+    Captures the last ~10 lines and looks for spinner verbs or the
+    `esc to interrupt` instruction Claude prints during turns. False
+    on capture failure — we'd rather forward and risk a no-op than
+    silently drop the user's message.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-10"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return False
+    return any(signal in out for signal in _CLAUDE_BUSY_SIGNALS)
+
+
 def _pane_from_thread(message: Message) -> str | None:
     """Return the pane that owns the topic this message was posted in.
 
@@ -2029,6 +2086,21 @@ async def on_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
     text = message.text
     if not text:
         return
+
+    # `!cmd` only takes Claude Code's `!`-REPL local-command path when
+    # typed at an idle prompt. Mid-turn keystrokes get queued/absorbed
+    # as plain text in the input buffer — no <bash-input> envelope ever
+    # gets written to the transcript, so the forwarder below has nothing
+    # to surface and the user sees a silent `→ %N` ack. Refuse + warn
+    # so the user knows to wait + resend (issue #9).
+    if text.startswith("!") and _pane_is_busy(pane_id):
+        _ = await message.reply_text(
+            f"⏸ {pane_id} is busy — `!cmd` only works at an idle prompt. "
+            "Wait for Claude to finish, then resend.",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
     logger.info("Sending to tmux pane %s: %s", pane_id, text)
     try:
         _send_to_tmux(pane_id, text)
