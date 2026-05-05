@@ -222,6 +222,13 @@ def _maybe_rename_topic(chat_id: str, pane_id: str, pane_title: str, cwd: str) -
     )
     if resp.get("ok"):
         state.set_cached_topic_name(pane_id, new_name)
+        return
+    # Topic was deleted by the user in Telegram? Drop the stale mapping
+    # so the next ``_topic_for_chat`` call lazily recreates it (issue
+    # #16). Subscription stays untouched.
+    err = str(resp.get("description") or "")
+    if "thread" in err.lower() or "TOPIC" in err:
+        _ = state.pop_topic(pane_id)
 
 
 _DEBUG_LOG = Path.home() / ".cache" / "tele-claude" / "debug" / "api-errors.log"
@@ -333,7 +340,17 @@ def send_message(
     # still lands in the supergroup's main thread so the user sees it.
     # Telegram returns "message thread not found" (sometimes localised
     # as "TOPIC_DELETED" or "message thread ID is invalid").
+    #
+    # Also drop the stale ``%pane → thread_id`` mapping so the next
+    # hook fire (or /panes reconcile) creates a fresh topic for this
+    # pane (issue #16). Subscription stays untouched — the pane is
+    # alive in tmux, it just lost its Telegram topic. Without this pop
+    # the mapping persists forever and the bot keeps trying (+ falling
+    # back to) the dead thread on every subsequent hook.
     if message_thread_id is not None and ("thread" in err.lower() or "TOPIC" in err):
+        stale_pane = state.get_pane_by_thread(int(message_thread_id))
+        if stale_pane is not None:
+            _ = state.pop_topic(stale_pane)
         retry = _call("sendMessage", {**base, "message_thread_id": None})
         if retry.get("ok"):
             return int(retry["result"]["message_id"])

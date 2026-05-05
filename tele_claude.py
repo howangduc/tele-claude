@@ -481,6 +481,58 @@ async def _delete_topic_for_pane(
         )
 
 
+async def _drop_dead_topic_mappings(
+    app: Application[Any, Any, Any, Any, Any, Any], pane_ids: set[str]
+) -> None:
+    """Pop ``pane_topics`` entries whose topic the user deleted in Telegram.
+
+    Validates each cached topic_id by issuing a no-op ``editForumTopic``
+    with the already-cached name. A "thread not found" / "TOPIC_DELETED"
+    response means the user deleted the topic from the Telegram side
+    while the bot wasn't watching — drop the mapping so the create-loop
+    in ``cmd_panes`` rebuilds a fresh topic for the same (still-alive)
+    pane (issue #16).
+
+    Subscription / mute / active-pane state is deliberately left alone —
+    losing the topic does NOT mean the user wanted to stop receiving
+    output from this pane.
+    """
+    if not _forum_enabled() or _FORUM_CHAT_ID is None:
+        return
+    for pane_id in pane_ids:
+        thread_id = state.get_topic(pane_id)
+        if thread_id is None:
+            continue
+        cached_name = state.get_cached_topic_name(pane_id) or pane_id
+        try:
+            _ = await app.bot.edit_forum_topic(
+                chat_id=_FORUM_CHAT_ID,
+                message_thread_id=thread_id,
+                name=cached_name,
+            )
+            continue  # topic still alive
+        except Exception as exc:
+            err = str(exc)
+            if "thread" in err.lower() or "TOPIC" in err:
+                _ = state.pop_topic(pane_id)
+                logger.info(
+                    "Dropped stale topic mapping for %s (thread_id=%d): %s",
+                    pane_id,
+                    thread_id,
+                    err,
+                )
+            else:
+                # Some other error (rate limit, permissions, …) — leave
+                # the mapping and let the next /panes try again.
+                logger.warning(
+                    "Topic-validation editForumTopic failed for %s "
+                    "(thread_id=%d), keeping mapping: %s",
+                    pane_id,
+                    thread_id,
+                    err,
+                )
+
+
 def _pane_arg_or_active(message: Message, args: list[str]) -> str | None:
     """Resolve target pane for a command: explicit %N arg wins, else context.
 
@@ -521,6 +573,13 @@ async def cmd_panes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ = state.prune_panes(alive_ids)
     for pane_id, thread_id in dead_topic_targets:
         await _delete_topic_for_pane(context.application, pane_id, thread_id)
+    # Drop any cached topic mapping whose topic the user deleted on the
+    # Telegram side. Without this, ``_ensure_topic_for_pane`` below
+    # short-circuits on the stale thread_id and the pane never gets a
+    # fresh topic — leaving it functionally orphaned (issue #16). The
+    # pane's subscription is intentionally untouched here.
+    if _forum_enabled():
+        await _drop_dead_topic_mappings(context.application, alive_ids)
     # Create topics for any live pane that doesn't have one yet — makes
     # /panes a full-reconcile command in both directions. No-op when
     # forum mode is off.
