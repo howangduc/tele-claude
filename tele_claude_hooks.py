@@ -1176,10 +1176,27 @@ def main_reply() -> None:
     # thread-id resolution AND for the Stage 3 rename below.
     topic_title = f"🤖 {cleaned}" if first_line and cleaned else "🤖 done"
 
-    for chat_id in _hook_chat_ids():
+    # Snapshot + ATOMICALLY clear progress state for every chat
+    # BEFORE we begin the slow delete + send path. A SubagentStop
+    # or PostToolUse firing concurrently uses get_progress_msg_id()
+    # to decide whether to resurrect the ⏳ placeholder via
+    # _edit_or_resend_progress's "message not found" branch; if we
+    # leave the state populated until after delete_message returns,
+    # that concurrent hook strands a fresh placeholder below the
+    # real 🤖 reply (visible bug when a subagent finishes during
+    # the Stop window).
+    chat_ids = list(_hook_chat_ids())
+    pre_progress: dict[str, int] = {}
+    for chat_id in chat_ids:
         progress_key = f"{session_id}:{chat_id}"
-        progress_id = state.get_progress_msg_id(progress_key)
+        msg_id = state.get_progress_msg_id(progress_key)
+        if msg_id is not None:
+            pre_progress[chat_id] = msg_id
+        state.clear_progress(progress_key)
+
+    for chat_id in chat_ids:
         thread_id = _topic_for_chat(chat_id, pane_id, topic_title, cwd)
+        progress_id = pre_progress.get(chat_id)
 
         # Delete the ⏳ placeholder (if any) so the real reply arrives as
         # a fresh sendMessage — which triggers a push notification.
@@ -1211,8 +1228,6 @@ def main_reply() -> None:
         # set (🤖 <preview>). Throttle + change-detection live inside the
         # helper so per-turn firing is safe.
         _maybe_rename_topic(chat_id, pane_id, topic_title, cwd)
-
-        state.clear_progress(progress_key)
     # Turn done — reset the heartbeat throttle for the next turn.
     _clear_heartbeat_if_session(session_id)
 
