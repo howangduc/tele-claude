@@ -11,10 +11,16 @@ dependency (handler → speech, never the reverse). Keeps the port
 testable in isolation.
 
 Env vars:
-    TELE_CLAUDE_STT_PROVIDER   ``elevenlabs`` (default) or ``selfhost``
-    TELE_CLAUDE_STT_API_KEY    API key for the active provider; may be
-                               ``None`` (the stub adapter raises anyway)
-    TELE_CLAUDE_STT_BASE_URL   Base URL for the self-hosted adapter
+    TELE_CLAUDE_STT_PROVIDER     ``elevenlabs`` (default) or ``selfhost``
+    TELE_CLAUDE_STT_API_KEY      API key for the active provider; may be
+                                 ``None`` (the stub adapter raises anyway)
+    TELE_CLAUDE_STT_BASE_URL     Base URL for the self-hosted adapter
+    TELE_CLAUDE_STT_TAG_EVENTS   ``1`` to let Scribe inline non-speech
+                                 event labels (e.g. ``(laughter)``,
+                                 ``(youthful music)``) into the
+                                 transcript. Off by default — those
+                                 tags pollute dictation when the
+                                 recording captures background sound.
 """
 
 from __future__ import annotations
@@ -82,8 +88,9 @@ class ElevenLabsAdapter(SpeechToTextPort):
     # length. Bump if users start hitting timeouts on longer recordings.
     _TIMEOUT_SECONDS = 60
 
-    def __init__(self, api_key: str | None) -> None:
+    def __init__(self, api_key: str | None, tag_events: bool = False) -> None:
         self._api_key = api_key
+        self._tag_events = tag_events
 
     async def transcribe(self, audio_path: Path) -> str:
         if not self._api_key:
@@ -116,6 +123,9 @@ class ElevenLabsAdapter(SpeechToTextPort):
                 "file", fh, filename=audio_path.name, content_type="audio/ogg"
             )
             form.add_field("model_id", self._MODEL_ID)
+            form.add_field(
+                "tag_audio_events", "true" if self._tag_events else "false"
+            )
             headers = {"xi-api-key": self._api_key or ""}
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -168,9 +178,12 @@ def get_stt_port(provider: str | None = None) -> SpeechToTextPort:
         or os.environ.get("TELE_CLAUDE_STT_PROVIDER", "elevenlabs")
     ).lower()
     api_key = os.environ.get("TELE_CLAUDE_STT_API_KEY") or None
+    tag_events = os.environ.get(
+        "TELE_CLAUDE_STT_TAG_EVENTS", "0"
+    ).strip().lower() in ("1", "true", "yes")
 
     if name == "elevenlabs":
-        return ElevenLabsAdapter(api_key=api_key)
+        return ElevenLabsAdapter(api_key=api_key, tag_events=tag_events)
     if name == "selfhost":
         base_url = os.environ.get("TELE_CLAUDE_STT_BASE_URL") or None
         return SelfHostedAdapter(base_url=base_url, api_key=api_key)
