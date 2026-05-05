@@ -90,6 +90,28 @@ def set_active_pane(chat_id: int, pane_id: str) -> None:
     _save(state)
 
 
+# Permission mode for newly-spawned panes (issue #27).
+# Single global string at key ``permission_mode``; absent = legacy bypass
+# behaviour for back-compat. Valid values are the keys of
+# ``constants.PERMISSION_MODES``: ``default``, ``acceptEdits``,
+# ``plan``, ``bypass``.
+
+
+def get_permission_mode() -> str:
+    """Return the active permission mode name. Defaults to ``bypass``
+    when unset so existing 0.1.x users see no behavior change."""
+    value = _load().get("permission_mode")
+    if isinstance(value, str) and value:
+        return value
+    return "bypass"
+
+
+def set_permission_mode(mode: str) -> None:
+    state = _load()
+    state["permission_mode"] = mode
+    _save(state)
+
+
 # ---------- Subscribed panes (hooks only fire for these) ----------
 
 

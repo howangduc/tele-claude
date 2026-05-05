@@ -652,20 +652,84 @@ async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ = await message.reply_text(f"Active pane: {pane_id} 🔔 subscribed")
 
 
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pick the permission mode for newly-spawned panes (issue #27).
+
+    Bare ``/mode`` shows a 4-button picker with the active mode marked.
+    ``/mode <name>`` sets directly without the picker. Subsequent
+    ``/new`` and ``/resume`` panes spawn with the chosen mode.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    active = state.get_permission_mode()
+
+    if args:
+        chosen = args[0].strip()
+        if chosen not in constants.PERMISSION_MODES:
+            valid = ", ".join(constants.PERMISSION_MODES.keys())
+            _ = await message.reply_text(
+                f"Unknown mode <code>{_html.escape(chosen)}</code>. "
+                f"Valid: <code>{_html.escape(valid)}</code>",
+                parse_mode="HTML",
+            )
+            return
+        state.set_permission_mode(chosen)
+        _ = await message.reply_text(
+            f"🛡 Permission mode → <code>{_html.escape(chosen)}</code>. "
+            f"Applies to subsequent /new and /resume panes.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Picker mode: one row per option, mark the active one with ✓.
+    rows: list[list[InlineKeyboardButton]] = []
+    for name in constants.PERMISSION_MODES:
+        marker = "✓ " if name == active else "  "
+        label = f"{marker}{name}"
+        if name == "bypass":
+            label += " ⚠️"
+        rows.append([InlineKeyboardButton(label, callback_data=f"mode:{name}")])
+
+    _ = await message.reply_text(
+        f"🛡 <b>Permission mode</b> · current: <code>{_html.escape(active)}</code>\n\n"
+        "Tap to change. Applies to subsequent /new and /resume panes.\n\n"
+        "<i>default</i> — normal permission prompts (1/2/3 keyboard).\n"
+        "<i>acceptEdits</i> — auto-accept edits, prompt other tools.\n"
+        "<i>plan</i> — planning-only; no Edit/Write/Bash without approval.\n"
+        "<i>bypass ⚠️</i> — <code>--dangerously-skip-permissions</code> (legacy default).",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
         return
     # In a forum topic, "which pane?" = the pane that owns this topic.
     # Outside a topic, fall back to the per-chat active pane.
+    mode = state.get_permission_mode()
+    mode_suffix = f" · mode <code>{_html.escape(mode)}</code>"
     topic_pane = _pane_from_thread(message)
     if topic_pane:
-        _ = await message.reply_text(f"Active: {topic_pane} (from this topic)")
+        _ = await message.reply_text(
+            f"Active: <code>{_html.escape(topic_pane)}</code> (from this topic){mode_suffix}",
+            parse_mode="HTML",
+        )
         return
     current = state.get_active_pane(message.chat_id)
-    _ = await message.reply_text(
-        f"Active: {current}" if current else "No active pane. Use /panes or /use %N"
-    )
+    if current:
+        _ = await message.reply_text(
+            f"Active: <code>{_html.escape(current)}</code>{mode_suffix}",
+            parse_mode="HTML",
+        )
+    else:
+        _ = await message.reply_text(
+            f"No active pane. Use /panes or /use %N.{mode_suffix}",
+            parse_mode="HTML",
+        )
 
 
 def _pick_session_name(cwd: str) -> str:
@@ -723,6 +787,33 @@ def _wait_for_claude_ready(
     return False
 
 
+def _resolve_launch_cmd(mode: str | None = None) -> str:
+    """Compute the effective LAUNCH_CMD for a new pane, honouring the
+    selected permission mode (issue #27).
+
+    When ``TELE_CLAUDE_NEW_LAUNCH_CMD`` is set, that env var wins —
+    we don't try to rewrite a user-provided wrapper. Otherwise we
+    swap the ``--dangerously-skip-permissions`` flag (or its absence)
+    for the picked mode's ``--permission-mode <value>``. ``mode=None``
+    falls back to ``state.get_permission_mode()``.
+
+    Bypass mode keeps the legacy ``--dangerously-skip-permissions``
+    flag verbatim — that's literally the 0.1.x default and we don't
+    want to silently change semantics for users who pick it.
+    """
+    # Power-user env override always wins. Don't second-guess it.
+    if "TELE_CLAUDE_NEW_LAUNCH_CMD" in os.environ:
+        return constants.LAUNCH_CMD
+    name = mode or state.get_permission_mode()
+    flag_value = constants.PERMISSION_MODES.get(name)
+    if name == "bypass" or flag_value is None:
+        # Legacy default, unchanged. Also catches an unknown mode
+        # smuggled in via a hand-edited state file — falls back to
+        # bypass behaviour rather than emitting an invalid flag.
+        return f"{constants._BASE_LAUNCH_CMD} --dangerously-skip-permissions"
+    return f"{constants._BASE_LAUNCH_CMD} --permission-mode {flag_value}"
+
+
 async def _spawn_new_pane(
     message: Message,
     cwd_arg: str,
@@ -749,7 +840,10 @@ async def _spawn_new_pane(
     overrides it with ``"<base> --resume <session-id>"`` so the same
     spawn machinery powers both fresh and resumed sessions.
     """
-    effective_launch_cmd = launch_cmd or constants.LAUNCH_CMD
+    # If the caller didn't pass a launch_cmd, derive it from the
+    # active /mode setting (issue #27). /resume passes its own
+    # ``--resume <id>`` form, so this only fires for /new spawns.
+    effective_launch_cmd = launch_cmd or _resolve_launch_cmd()
     logger.info(
         "spawn_new_pane: cwd_arg=%r launch_cmd=%r", cwd_arg, effective_launch_cmd
     )
@@ -1214,7 +1308,10 @@ async def _spawn_resume_pane(
     # ``--resume <id>`` is appended literally — keeping the rest of
     # LAUNCH_CMD (the ``TELE_CLAUDE=1`` opt-in + flags) intact so hooks
     # still fire on the resumed pane.
-    launch_cmd = f"{constants.LAUNCH_CMD} --resume {session_id}"
+    # Resume honours the active /mode too — append --resume after the
+    # mode-aware base (issue #27). Env-var override path returns the
+    # raw LAUNCH_CMD as before.
+    launch_cmd = f"{_resolve_launch_cmd()} --resume {session_id}"
     short_id = session_id[:8]
     await _spawn_new_pane(
         message,
@@ -1624,6 +1721,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _ = await query.edit_message_text(
             f"Active pane: {pane_id}\n\nSend any message to forward it here."
         )
+        return
+
+    if data.startswith("mode:"):
+        chosen = data[len("mode:"):]
+        if chosen not in constants.PERMISSION_MODES:
+            _ = await query.answer("Unknown mode", show_alert=True)
+            return
+        state.set_permission_mode(chosen)
+        _ = await query.answer(f"🛡 → {chosen}")
+        try:
+            _ = await query.edit_message_text(
+                f"🛡 Permission mode → <code>{_html.escape(chosen)}</code>\n\n"
+                f"Applies to subsequent /new and /resume panes. "
+                f"Existing panes keep whatever mode they spawned with.",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception:
+            # Telegram occasionally rejects edits on messages whose HTML
+            # has become malformed by prior edits, or when the message
+            # was deleted between dispatch and edit. State persisted +
+            # toast already fired, so swallow rather than alarm the
+            # user with a noisy retry. Matches the ans:/voice: pattern.
+            pass
         return
 
     if data.startswith("ans:"):
@@ -2624,6 +2745,7 @@ _Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Any]
 _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("panes", "List Claude Code panes (tap to activate+subscribe)", cmd_panes),
     ("use", "Set active pane: /use %N", cmd_use),
+    ("mode", "Set permission mode for new panes: /mode [name]", cmd_mode),
     ("which", "Show the active pane", cmd_which),
     ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
     ("new", "Spawn a new Claude pane: /new [dir]", cmd_new),

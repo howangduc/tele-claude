@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/mode` command.** Pick the permission mode (`default` / `acceptEdits` / `plan` / `bypass`) for newly-spawned `/new` and `/resume` panes. Inline picker shows the active mode with a `✓`; `/mode <name>` skips the picker. Persisted in `state.json`. `/which` now surfaces the active mode. Default stays `bypass` (`--dangerously-skip-permissions`) for back-compat — opt into prompts via `/mode default`. `TELE_CLAUDE_NEW_LAUNCH_CMD` env var still wins (power-user wrappers unchanged). (#27)
+
 ## [0.1.2] — 2026-05-05
 
 ### Added

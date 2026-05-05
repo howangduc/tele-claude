@@ -26,10 +26,29 @@ from pathlib import Path
 # form so it works without depending on the user's bashrc aliases.
 # Override per-machine via ``TELE_CLAUDE_NEW_LAUNCH_CMD`` (e.g. set it
 # to ``TELE_CLAUDE=1 ccm`` if you have a Claude Code wrapper alias).
+# Common prefix shared by the default LAUNCH_CMD and _resolve_launch_cmd's
+# generated commands — keeps the env-var name + bin name in one place so
+# they don't drift (e.g. if we rename TELE_CLAUDE to something else).
+_BASE_LAUNCH_CMD = "TELE_CLAUDE=1 claude"
+
 LAUNCH_CMD = os.environ.get(
     "TELE_CLAUDE_NEW_LAUNCH_CMD",
-    "TELE_CLAUDE=1 claude --dangerously-skip-permissions",
+    f"{_BASE_LAUNCH_CMD} --dangerously-skip-permissions",
 )
+
+# Permission modes selectable from the bot's /mode command (issue #27).
+# Maps the user-facing mode name to Claude Code's --permission-mode flag
+# value. ``None`` means "no flag at all" — bypass uses the legacy
+# --dangerously-skip-permissions instead, preserving the 0.1.x default
+# without forcing a breaking behaviour change. Power users who set
+# TELE_CLAUDE_NEW_LAUNCH_CMD bypass this whole machinery (their
+# override wins; we never inject --permission-mode into a custom cmd).
+PERMISSION_MODES: dict[str, str | None] = {
+    "default": "default",        # normal permission prompts (1/2/3 keyboard via ans:)
+    "acceptEdits": "acceptEdits",  # auto-accept file edits, prompt for other tools
+    "plan": "plan",              # planning-only — no Edit/Write/Bash without approval
+    "bypass": None,              # --dangerously-skip-permissions (current default)
+}
 
 # ---------- tmux ----------
 
