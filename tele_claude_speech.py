@@ -31,6 +31,8 @@ from pathlib import Path
 
 import aiohttp
 
+import tele_claude_constants as constants
+
 
 # ---------- Errors ----------
 
@@ -178,9 +180,7 @@ def get_stt_port(provider: str | None = None) -> SpeechToTextPort:
         or os.environ.get("TELE_CLAUDE_STT_PROVIDER", "elevenlabs")
     ).lower()
     api_key = os.environ.get("TELE_CLAUDE_STT_API_KEY") or None
-    tag_events = os.environ.get(
-        "TELE_CLAUDE_STT_TAG_EVENTS", "0"
-    ).strip().lower() in ("1", "true", "yes")
+    tag_events = constants.env_truthy("TELE_CLAUDE_STT_TAG_EVENTS")
 
     if name == "elevenlabs":
         return ElevenLabsAdapter(api_key=api_key, tag_events=tag_events)

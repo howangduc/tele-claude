@@ -827,8 +827,7 @@ _TRUST_FOLDER_MARKER = "Yes, I trust this folder"
 
 
 def _auto_trust_enabled() -> bool:
-    raw = os.environ.get("TELE_CLAUDE_AUTO_TRUST", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return constants.env_truthy("TELE_CLAUDE_AUTO_TRUST")
 
 
 def _wait_for_claude_ready(

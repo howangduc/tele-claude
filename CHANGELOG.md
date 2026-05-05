@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-05
+
+### Changed
+
+- ElevenLabs Scribe `tag_audio_events` now defaults to **off** so background music / typing / ambient sound no longer leak `(youthful music)`-style tags into voice-note dictation. Set `TELE_CLAUDE_STT_TAG_EVENTS=1` to opt back in. (#34)
+- Internal: extracted `constants.env_truthy(name)` helper. `_auto_trust_enabled` and the new STT-tag-events parser both go through it now — same accepted set (`1`/`true`/`yes`/`on`, case- and whitespace-insensitive). Was inconsistent across the two parsers before this consolidation.
+
 ## [0.3.0] — 2026-05-05
 
 ### Added

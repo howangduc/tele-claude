@@ -17,6 +17,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# ---------- Env helpers ----------
+
+
+def env_truthy(name: str) -> bool:
+    """Read ``name`` from env and return True if it looks affirmative.
+
+    Recognises ``1`` / ``true`` / ``yes`` / ``on`` (case- and
+    whitespace-insensitive). Anything else (including unset) reads as
+    False. Used by feature gates like ``TELE_CLAUDE_AUTO_TRUST`` and
+    ``TELE_CLAUDE_STT_TAG_EVENTS`` so they share one set of accepted
+    values — drift between gates was a real review finding (PR #34).
+    """
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------- Launch command ----------
 
 # Shell command typed into a freshly-spawned pane by ``/new``. The
