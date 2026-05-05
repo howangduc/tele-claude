@@ -664,6 +664,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = list(context.args or [])
     active = state.get_permission_mode()
+    logger.info("cmd_mode invoked: args=%r active=%r", args, active)
 
     if args:
         chosen = args[0].strip()
@@ -676,6 +677,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         state.set_permission_mode(chosen)
+        logger.info("cmd_mode: %r → %r", active, chosen)
         _ = await message.reply_text(
             f"🛡 Permission mode → <code>{_html.escape(chosen)}</code>. "
             f"Applies to subsequent /new and /resume panes.",
@@ -759,6 +761,22 @@ def _pick_session_name(cwd: str) -> str:
     return candidate
 
 
+# Claude Code prints this on first-time entry into an unfamiliar
+# directory — a startup security gate distinct from any tool-permission
+# notification, so no Notification hook fires and the bot has no
+# inline-keyboard event to surface. _wait_for_claude_ready detects it
+# in the pane capture and (when TELE_CLAUDE_AUTO_TRUST is truthy) sends
+# a "1\n" keystroke to accept it, then keeps polling for the real ❯
+# prompt. Without auto-trust the spawn ack times out at ⏳ Still booting
+# and the user must type "1" via Telegram to unstick.
+_TRUST_FOLDER_MARKER = "Yes, I trust this folder"
+
+
+def _auto_trust_enabled() -> bool:
+    raw = os.environ.get("TELE_CLAUDE_AUTO_TRUST", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _wait_for_claude_ready(
     pane_id: str, max_wait_seconds: float = 6.0, poll_seconds: float = 0.3
 ) -> bool:
@@ -769,12 +787,18 @@ def _wait_for_claude_ready(
     first message (issue #11). This blocks the spawn handler briefly
     until the prompt char is visible, then returns True. Timeout
     returns False — caller decides whether to warn the user.
+
+    When ``TELE_CLAUDE_AUTO_TRUST`` is truthy and the capture shows the
+    "Yes, I trust this folder" gate, sends "1\\n" once and keeps
+    polling — saves the user from typing it via Telegram on every fresh
+    directory.
     """
+    auto_trusted = False
     deadline = time.monotonic() + max_wait_seconds
     while time.monotonic() < deadline:
         try:
             out = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-5"],
+                ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-30"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -783,6 +807,22 @@ def _wait_for_claude_ready(
             return False
         if "❯" in out:
             return True
+        if (
+            not auto_trusted
+            and _TRUST_FOLDER_MARKER in out
+            and _auto_trust_enabled()
+        ):
+            logger.info(
+                "auto-trust: detected trust-folder gate on %s, sending '1'",
+                pane_id,
+            )
+            try:
+                _send_to_tmux(pane_id, "1")
+            except subprocess.CalledProcessError:
+                logger.exception("auto-trust send failed for %s", pane_id)
+            # Set the flag regardless — one attempt; if it didn't take,
+            # let the user finish manually. Avoids a key-press loop.
+            auto_trusted = True
         time.sleep(poll_seconds)
     return False
 
@@ -803,15 +843,21 @@ def _resolve_launch_cmd(mode: str | None = None) -> str:
     """
     # Power-user env override always wins. Don't second-guess it.
     if "TELE_CLAUDE_NEW_LAUNCH_CMD" in os.environ:
-        return constants.LAUNCH_CMD
+        cmd = constants.LAUNCH_CMD
+        logger.info("resolve_launch_cmd: env-override → %r", cmd)
+        return cmd
     name = mode or state.get_permission_mode()
     flag_value = constants.PERMISSION_MODES.get(name)
     if name == "bypass" or flag_value is None:
         # Legacy default, unchanged. Also catches an unknown mode
         # smuggled in via a hand-edited state file — falls back to
         # bypass behaviour rather than emitting an invalid flag.
-        return f"{constants._BASE_LAUNCH_CMD} --dangerously-skip-permissions"
-    return f"{constants._BASE_LAUNCH_CMD} --permission-mode {flag_value}"
+        cmd = f"{constants._BASE_LAUNCH_CMD} --dangerously-skip-permissions"
+        logger.info("resolve_launch_cmd: mode=%r → %r", name, cmd)
+        return cmd
+    cmd = f"{constants._BASE_LAUNCH_CMD} --permission-mode {flag_value}"
+    logger.info("resolve_launch_cmd: mode=%r → %r", name, cmd)
+    return cmd
 
 
 async def _spawn_new_pane(
@@ -1729,6 +1775,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ = await query.answer("Unknown mode", show_alert=True)
             return
         state.set_permission_mode(chosen)
+        logger.info("mode: callback set permission_mode=%r", chosen)
         _ = await query.answer(f"🛡 → {chosen}")
         try:
             _ = await query.edit_message_text(

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-05
+
+### Added
+
+- **Auto-trust new folders.** When `TELE_CLAUDE_AUTO_TRUST=1` is set, the `/new` and `/resume` ready-wait detects Claude Code's first-time **"Yes, I trust this folder"** safety gate in the pane capture and sends `1` automatically — saves typing it via Telegram every time you spawn into a fresh directory. Default off (current behavior preserved).
+
+### Changed
+
+- `/mode` command, `mode:` callback, and `_resolve_launch_cmd` now emit `INFO` log lines (`cmd_mode invoked`, `mode: callback set permission_mode=…`, `resolve_launch_cmd: mode=… → …`) so a future "set mode but pane spawned wrong" report has direct telemetry instead of state-file mtime archaeology.
+- `_wait_for_claude_ready` now captures the last 30 lines of the pane (was 5) so the trust-folder gate lands inside the search window.
+
 ## [0.2.0] — 2026-05-05
 
 ### Added
