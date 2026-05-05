@@ -16,7 +16,12 @@ dependencies = [
 ]
 
 [project.scripts]
-tele-claude = "tele_claude:main"
+# Dispatcher delegates to ``tele_claude:main`` when no subcommand is
+# given (existing behavior) and to ``tele_claude_doctor:main`` for
+# ``tele-claude doctor``. Keeping the bot import lazy lets ``doctor``
+# run even when CLAUDE_TELEGRAM_* env vars aren't set yet — that's
+# precisely the broken-install state doctor exists to diagnose.
+tele-claude = "tele_claude_cli:main"
 tele-claude-format = "tele_claude_format:main"
 
 [dependency-groups]

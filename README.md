@@ -394,6 +394,16 @@ alias cc='claude --dangerously-skip-permissions'
 
 Then `source ~/.bashrc` (or open a fresh terminal) so the aliases are live in your current shell. **Required on every machine you set up the bot on** — without these aliases, hooks can't forward (since `TELE_CLAUDE` isn't set on the claude process).
 
+> ⚠️ **Already-running claude sessions don't pick up new aliases.** `TELE_CLAUDE=1` is fixed at process start, so a claude that was running before you added the aliases keeps firing hooks with `TELE_CLAUDE=` empty (silent — no forwarding, no error). Inside any pre-existing session, type `/exit` to drop back to bash, then `source ~/.bashrc && cc` to relaunch with the aliases active. Same applies to **every other open terminal** — they each need a fresh `source ~/.bashrc` (or just close + reopen) before launching `claude`.
+
+**Verify with the doctor (recommended):**
+
+```bash
+tele-claude doctor
+```
+
+This runs a one-shot check for: `claude` on PATH, the alias resolves to `TELE_CLAUDE=1 command claude`, `TELE_CLAUDE` actually propagates to a child process, the hook scripts exist (you'll set those up in the next step), `~/.config/tele-claude/env` is readable, and `tmux` + `python-telegram-bot` are installed. Prints one ✓/✗ line per check with a fix hint on each ✗. Re-run after each step in this section if anything fails.
+
 Usage:
 
 | Command | Behavior |
@@ -403,7 +413,7 @@ Usage:
 | `command claude` | Runs Claude silently (bypasses the alias) |
 | `TELE_CLAUDE=0 claude` | One-off silent override |
 
-Verify the chain after sourcing:
+Manual chain verification (if you skipped the doctor):
 
 ```bash
 type claude   # claude is aliased to `TELE_CLAUDE=1 command claude'
@@ -411,8 +421,6 @@ type cc       # cc is aliased to `claude --dangerously-skip-permissions'
 ```
 
 > Prefer explicit opt-in? Skip the `claude` alias and use a function instead: `tclaude() { TELE_CLAUDE=1 claude "$@"; }` — invoke `tclaude` on the sessions you want forwarded, plain `claude` for the rest.
-
-> **Already-running claude sessions don't pick up new aliases.** `TELE_CLAUDE=1` is fixed at process start, so a claude that was running before you added the aliases keeps firing hooks with `TELE_CLAUDE=` empty (silent). Inside it, type `/exit` to drop back to bash, then `source ~/.bashrc && cc` to relaunch with the aliases active.
 
 ### 3. Install the hook wrappers
 
@@ -555,9 +563,12 @@ Add to `~/.claude/settings.json`:
 
 ```bash
 source ~/.bashrc       # picks up the claude alias
+tele-claude doctor     # confirm: alias, TELE_CLAUDE propagation, hook scripts, env, tmux
 tmux new -s work       # or attach an existing pane
 claude                 # forwarding is on by default
 ```
+
+If `tele-claude doctor` reports any ✗, fix that item and re-run before launching `claude` — silent hooks (no errors, no notifications) are nearly always one of the things doctor checks for.
 
 From Telegram:
 
