@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-05
+
+### Added
+
+- **`/resume` command.** Pick a previous Claude Code session from `~/.claude/projects/` and spawn a new pane running `claude --resume <session-id>` in the project's cwd. Picker shows up to 12 newest-first sessions with project basename · age · first-prompt preview. `/resume <dir>` narrows by starts-with path match. Reuses the new ready-wait + auto-create-topic plumbing from `/new`. (#17)
+- **`tele-claude doctor` subcommand.** Verifies install correctness with 7 checks (claude on PATH, alias resolves, `TELE_CLAUDE` propagates to a child shell, hook scripts present, env file present with required vars, tmux installed, python-telegram-bot importable). Each check prints `✓`/`✗` with an actionable fix hint on failure. New `tele_claude_cli.py` thin dispatcher so `doctor` runs without the bot's import-time env-var crash. (#15)
+
+### Fixed
+
+- **`!cmd` shell command output forwarding actually works now.** PR #5 patched `_last_assistant_text` for `<local-command-stdout>` envelopes — wrong layer, since Claude Code's `!`-REPL fires no Stop/progress/notify hooks at all (no LLM turn). Real fix lives in `tele_claude.on_message`: intercepts the `!` prefix, schedules an async transcript-tail task that polls for the matching `<bash-input>`/`<bash-stdout>` entries Claude wrote, replies with a 🐚 fenced block. (#1, real fix)
+- **Multi-question `AskUserQuestion` now renders correctly.** Notification hook was firing before Claude flushed the matching `tool_use` JSONL entry, so `_find_pending_context` returned `None` and the body fell back to the generic `Allow / Always / Deny` keyboard. Wrapped `_find_pending_context` in a wait-for-stable poll (1.5s max, returns immediately if entry already on disk). Adds a breadcrumb to `~/.cache/tele-claude/debug/api-errors.log` if the wait still times out. (#8)
+- **`!cmd` mid-turn forwards now refuse cleanly.** When Claude is mid-turn ("Beaming…"), `tmux send-keys "!ls"` keystrokes get absorbed as plain text instead of triggering the `!`-REPL handler, so no `<bash-input>` envelope ever lands and the forwarder finds nothing. Bot now captures the target pane's last lines, refuses with `⏸ %N is busy` if a spinner verb or `esc to interrupt` is visible. (#9)
+- **`/new` auto-creates the forum topic AND waits for Claude TUI to be ready.** Two coupled gaps: no topic creation forced manual `/panes` step; fire-and-forget spawn replied "✅ Spawned" before Claude's TUI was listening, so the user's first message hit a TUI mid-banner-draw and got eaten. Now polls the pane for the `❯` prompt sentinel (max 6s) and posts the spawn ack INSIDE the new topic with either `🟢 Claude ready — chat away.` or `⏳ Still booting`. (#11)
+- **Pane stays in `/panes` after topic deletion.** Bot never detected forum-topic deletion, so the cached `%pane → thread_id` mapping persisted forever; hook fallbacks landed in the main thread instead of recreating the topic. Now drops the stale mapping at three sites (`send_message` fallback, `_maybe_rename_topic` fallback, `_drop_dead_topic_mappings` invoked by `cmd_panes` reconciliation), so the next `/panes` rebuilds a fresh topic for the live pane. (#16)
+- **Stranded ⏳ progress placeholder no longer dangles below the 🤖 reply.** Race between `main_reply` (Stop hook) and `main_subagent_stop` / `main_post_tool_use`: when a subagent finished during the Stop window, the concurrent hook used `_edit_or_resend_progress`'s "message not found" branch to send a fresh placeholder while `main_reply` was still in its delete-then-send loop. Fix: `main_reply` now snapshots + atomically clears progress state for all chats BEFORE entering the slow delete + send path, so concurrent hooks see `any_pending = False` and bail.
+- **`/resume` no longer spawns a duplicate pane** when the picked session is already live. New `_find_live_pane_for_session(session_id)` checks (a) the pane → transcript mapping the hooks record, then (b) `/proc/<pane_pid>/cmdline` for `--resume <id>`. When found, re-binds the topic + active pane instead of spawning. (#23)
+
 ## [0.1.1] — 2026-05-04
 
 ### Added
