@@ -112,6 +112,63 @@ def set_permission_mode(mode: str) -> None:
     _save(state)
 
 
+# Pinned TodoWrite cards (issue #28).
+# Per (chat_id, pane_id) → Telegram message_id of the pinned card.
+# Persisted in state.json under key ``pinned_todos`` as a flat dict
+# of ``"{chat_id}:{pane_id}"`` → int.
+#
+# Global toggle ``todowrite_pinned_enabled`` defaults to True; can be
+# flipped via /pinned on|off. Off = no new pins are created and no
+# existing ones are edited (the bot stops touching pinned messages
+# entirely until re-enabled).
+
+
+def _pinned_todos_key(chat_id: str, pane_id: str) -> str:
+    return f"{chat_id}:{pane_id}"
+
+
+def get_pinned_todo_msg_id(chat_id: str, pane_id: str) -> int | None:
+    raw = _load().get("pinned_todos", {})
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get(_pinned_todos_key(chat_id, pane_id))
+    return int(value) if isinstance(value, int) else None
+
+
+def set_pinned_todo_msg_id(chat_id: str, pane_id: str, message_id: int) -> None:
+    state = _load()
+    pins = state.get("pinned_todos")
+    if not isinstance(pins, dict):
+        pins = {}
+    pins[_pinned_todos_key(chat_id, pane_id)] = int(message_id)
+    state["pinned_todos"] = pins
+    _save(state)
+
+
+def clear_pinned_todo_msg_id(chat_id: str, pane_id: str) -> None:
+    state = _load()
+    pins = state.get("pinned_todos")
+    if not isinstance(pins, dict):
+        return
+    pins.pop(_pinned_todos_key(chat_id, pane_id), None)
+    state["pinned_todos"] = pins
+    _save(state)
+
+
+def get_todowrite_pinned_enabled() -> bool:
+    """Default True — pinning is opt-OUT, not opt-in."""
+    value = _load().get("todowrite_pinned_enabled")
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def set_todowrite_pinned_enabled(enabled: bool) -> None:
+    state = _load()
+    state["todowrite_pinned_enabled"] = bool(enabled)
+    _save(state)
+
+
 # ---------- Subscribed panes (hooks only fire for these) ----------
 
 

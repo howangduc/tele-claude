@@ -279,6 +279,89 @@ def check_python_telegram_bot() -> bool:
     return True
 
 
+def check_pin_perm() -> bool:
+    """Verify the bot has can_pin_messages in the supergroup.
+
+    Required for the TodoWrite pinned-card feature (issue #28). Skipped
+    (returns OK) when forum mode isn't enabled — pinning falls back to
+    the originating chat in that case and the user has personal-chat
+    pin slot semantics anyway.
+    """
+    chat_id = os.environ.get("TELE_CLAUDE_SUPERGROUP_ID", "").strip()
+    bot_token = os.environ.get("CLAUDE_TELEGRAM_BOT_TOKEN", "").strip()
+    if not chat_id:
+        _print_check(
+            True,
+            "bot can_pin_messages",
+            "forum mode disabled (TELE_CLAUDE_SUPERGROUP_ID unset) — skipped",
+        )
+        return True
+    if not bot_token:
+        _print_check(
+            False,
+            "bot can_pin_messages",
+            "CLAUDE_TELEGRAM_BOT_TOKEN missing",
+            "set CLAUDE_TELEGRAM_BOT_TOKEN in ~/.config/tele-claude/env.",
+        )
+        return False
+    try:
+        import json as _json
+        import urllib.parse
+        import urllib.request
+
+        # getMe → bot user id; getChatMember → can_pin_messages
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{bot_token}/getMe", timeout=5
+        ) as r:
+            me = _json.loads(r.read().decode())
+        if not me.get("ok"):
+            _print_check(
+                False,
+                "bot can_pin_messages",
+                f"getMe failed: {me.get('description', 'unknown')}",
+                "check CLAUDE_TELEGRAM_BOT_TOKEN is valid.",
+            )
+            return False
+        bot_id = me["result"]["id"]
+        params = urllib.parse.urlencode({"chat_id": chat_id, "user_id": bot_id})
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{bot_token}/getChatMember?{params}",
+            timeout=5,
+        ) as r:
+            member = _json.loads(r.read().decode())
+        if not member.get("ok"):
+            _print_check(
+                False,
+                "bot can_pin_messages",
+                f"getChatMember failed: {member.get('description', 'unknown')}",
+                "check the bot is a member of TELE_CLAUDE_SUPERGROUP_ID.",
+            )
+            return False
+        result = member.get("result", {})
+        can_pin = bool(result.get("can_pin_messages"))
+        if can_pin:
+            _print_check(
+                True, "bot can_pin_messages", "bot has can_pin_messages in supergroup"
+            )
+            return True
+        _print_check(
+            False,
+            "bot can_pin_messages",
+            "bot lacks can_pin_messages in supergroup",
+            "promote the bot to admin with the Pin Messages permission, "
+            "or disable pinning via /pinned off.",
+        )
+        return False
+    except (OSError, ValueError) as e:
+        _print_check(
+            False,
+            "bot can_pin_messages",
+            f"could not check pin perm: {e}",
+            "verify network access to api.telegram.org.",
+        )
+        return False
+
+
 # ---------- Entry point ----------
 
 
@@ -293,6 +376,7 @@ def main() -> int:
         check_credentials_file,
         check_tmux_installed,
         check_python_telegram_bot,
+        check_pin_perm,
     )
     results = [check() for check in checks]
     passed = sum(results)

@@ -426,6 +426,31 @@ def delete_message(chat_id: str, message_id: int) -> bool:
     return bool(resp.get("ok"))
 
 
+def pin_chat_message(
+    chat_id: str, message_id: int, disable_notification: bool = True
+) -> bool:
+    """Pin a message in a chat. Returns True on success.
+
+    ``disable_notification=True`` is what we want for TodoWrite cards
+    (#28) — pinning shouldn't push a notification on every edit cycle.
+    Failures (missing perm, message deleted, rate-limited) are logged
+    via _log_api_error but not raised — caller decides whether to
+    treat as fatal (issue #28: never fatal, just warn-and-continue).
+    """
+    resp = _call(
+        "pinChatMessage",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "disable_notification": disable_notification,
+        },
+    )
+    if resp.get("ok"):
+        return True
+    _log_api_error("pinChatMessage", {"text": ""}, str(resp.get("description") or ""))
+    return False
+
+
 # ---------- Shared helpers ----------
 
 
@@ -1462,6 +1487,69 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+# TodoWrite render constants (issue #28).
+#
+# 70 chars per item is empirical: covers ~95% of TodoWrite content
+# strings observed in this repo's transcripts (sampled ~80 calls);
+# anything longer is usually agent-generated explanatory prose that
+# truncates cleanly with " …". Pick higher only after measuring.
+_TODO_ITEM_CONTENT_MAX = 70
+#
+# 3500 leaves a ~600-char margin under Telegram's 4096-char hard limit
+# (constants.MAX_MESSAGE_LEN is also 4000) for HTML-tag inflation
+# (each <b>…</b> / <code>…</code> roughly 1.3× the visible text) plus
+# the tail "… +N more" line and any future header expansion.
+_TODO_CARD_TOTAL_MAX = 3500
+_TODO_STATUS_MARKERS: dict[str, str] = {
+    "completed": "✅",
+    "in_progress": "🟡",
+    "pending": "⚪",
+}
+
+
+def _render_todos(
+    todos: list[dict[str, Any]], pane_id: str
+) -> str:
+    """Compose the pinned-card HTML body from a TodoWrite tool_input.
+
+    Each todo item: ``{content, status, activeForm}``. We render
+    `content` (the imperative form) — `activeForm` (continuous form) is
+    Claude's own usage hint, not what we want on the card.
+
+    Returns an empty string if ``todos`` is empty or malformed —
+    caller treats that as "nothing to pin / unpin".
+    """
+    if not isinstance(todos, list) or not todos:
+        return ""
+    done = sum(
+        1 for t in todos if isinstance(t, dict) and t.get("status") == "completed"
+    )
+    total = len(todos)
+    header = (
+        f"📋 <b>Todos</b> · <code>{html.escape(pane_id)}</code> · {done}/{total}"
+    )
+    lines: list[str] = [header]
+    body_chars = len(header)
+    truncated_items = 0
+    for idx, item in enumerate(todos):
+        if not isinstance(item, dict):
+            truncated_items = total - idx
+            break
+        marker = _TODO_STATUS_MARKERS.get(str(item.get("status") or ""), "⚪")
+        content = str(item.get("content") or "").strip()
+        if len(content) > _TODO_ITEM_CONTENT_MAX:
+            content = content[: _TODO_ITEM_CONTENT_MAX - 1].rstrip() + "…"
+        line = f"{marker} {html.escape(content)}"
+        if body_chars + len(line) + 1 > _TODO_CARD_TOTAL_MAX:
+            truncated_items = total - idx
+            break
+        lines.append(line)
+        body_chars += len(line) + 1
+    if truncated_items > 0:
+        lines.append(f"<i>… +{truncated_items} more</i>")
+    return "\n".join(lines)
+
+
 def _summarise_in_progress(
     transcript_path: Path,
 ) -> tuple[int, str, str | None, list[str]]:
@@ -1550,6 +1638,66 @@ def _summarise_in_progress(
     return tool_count, last_tool, latest_text, running_subagents
 
 
+def _handle_todowrite_pin(
+    session_id: str, pane_id: str, cwd: str, todos: list[Any]
+) -> None:
+    """Pin or update the TodoWrite card for ``pane_id`` (issue #28).
+
+    Bails silently if:
+      - The global pin toggle is off (``state.get_todowrite_pinned_enabled``).
+      - The pane isn't subscribed.
+      - The pane is muted.
+      - We're inside the per-pane debounce window (1.5 s, shared
+        with the heartbeat throttle file so SubagentStop / PostToolUse
+        / TodoWrite never race against each other on edits).
+      - The render is empty (no todos / malformed input).
+    """
+    if not state.get_todowrite_pinned_enabled():
+        return
+    if pane_id and not state.is_subscribed(pane_id):
+        return
+    if pane_id and state.is_muted(pane_id):
+        return
+    # 1.5s floor — Telegram rate-limits chat edits at ~1/sec; 1.5
+    # gives margin while still feeling live during rapid TodoWrite
+    # bursts. Shares the same throttle file as PostToolUse + SubagentStop
+    # so the three never race against each other on a single chat.
+    if not state.should_heartbeat(session_id, min_interval_seconds=1.5):
+        return
+    body = _render_todos(todos, pane_id)
+    if not body:
+        return
+    for chat_id in _hook_chat_ids():
+        thread_id = _topic_for_chat(chat_id, pane_id, "📋 Todos", cwd)
+        existing = state.get_pinned_todo_msg_id(chat_id, pane_id)
+        if existing is None:
+            new_id = send_message(
+                chat_id,
+                body,
+                parse_mode="HTML",
+                disable_notification=True,
+                message_thread_id=thread_id,
+            )
+            if new_id is None:
+                continue
+            if pin_chat_message(chat_id, new_id):
+                state.set_pinned_todo_msg_id(chat_id, pane_id, new_id)
+            else:
+                # Pin failed (missing perm / forum-mode quirk).
+                # Keep the message but don't track it as pinned —
+                # next call will send a fresh one. Better than
+                # silently editing an unpinned message.
+                pass
+            continue
+        ok, err = edit_message(chat_id, existing, body, parse_mode="HTML")
+        if ok:
+            continue
+        # Pinned message was deleted by the user (or the topic was
+        # nuked). Drop the stale id and try a fresh send next call.
+        if "message to edit not found" in err.lower():
+            state.clear_pinned_todo_msg_id(chat_id, pane_id)
+
+
 def main_post_tool_use() -> None:
     """Update the ⏳ placeholder with a live progress snapshot.
 
@@ -1565,7 +1713,29 @@ def main_post_tool_use() -> None:
     cwd = str(data.get("cwd") or "")
     pane_id = os.environ.get("TMUX_PANE", "")
 
+    tool_name = str(data.get("tool_name") or "")
+    tool_input = data.get("tool_input") or {}
     state.touch_activity(session_id)
+
+    # TodoWrite pinned-card path (issue #28). Runs INDEPENDENTLY of
+    # the ⏳ heartbeat below — different state, different debounce,
+    # never gated on "any progress placeholder exists". Bails fast
+    # for every other tool name so non-TodoWrite calls pay only one
+    # string compare.
+    if tool_name == "TodoWrite" and isinstance(tool_input, dict):
+        _handle_todowrite_pin(
+            session_id=session_id,
+            pane_id=pane_id,
+            cwd=cwd,
+            todos=tool_input.get("todos") or [],
+        )
+        # Fall through. _handle_todowrite_pin and the ⏳ heartbeat
+        # below SHARE the should_heartbeat throttle file (1.5s floor),
+        # so on a TodoWrite tick the heartbeat below is typically
+        # suppressed (this call already wrote the timestamp). The next
+        # PostToolUse fires ⏳ once outside the 5s window — counter
+        # catches up there. Acceptable: TodoWrite cards convey richer
+        # state than the counter anyway.
 
     if pane_id and not state.is_subscribed(pane_id):
         return

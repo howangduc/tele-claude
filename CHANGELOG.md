@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **TodoWrite pinned cards** (issue #28). When Claude Code's `TodoWrite` tool fires, the bot pins a compact todo card in the pane's forum topic and edits it in place as items move through `pending → in_progress → completed`. New `/pinned on|off` toggle (default on) controls the feature globally — useful in private chats where the single pin slot is precious. New env-independent `tele-claude doctor` check verifies the bot has `can_pin_messages` in the supergroup. Per-pane debounce shares the heartbeat throttle (1.5s minimum between edits) so SubagentStop / PostToolUse / TodoWrite don't race on Telegram's rate limit. New state keys: `pinned_todos`, `todowrite_pinned_enabled`. (#28)
+
 ## [0.2.1] — 2026-05-05
 
 ### Added

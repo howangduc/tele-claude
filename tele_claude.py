@@ -706,6 +706,60 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_pinned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle the TodoWrite pinned-card feature (issue #28).
+
+    Bare ``/pinned`` shows current state with on/off buttons.
+    ``/pinned on`` and ``/pinned off`` set directly. Affects all
+    panes — when off, the bot stops pinning AND stops editing any
+    existing pinned cards. When flipped back on, the next TodoWrite
+    fire creates a fresh pinned card per pane.
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    enabled = state.get_todowrite_pinned_enabled()
+    logger.info("cmd_pinned invoked: args=%r enabled=%r", args, enabled)
+
+    if args:
+        chosen = args[0].strip().lower()
+        if chosen not in ("on", "off"):
+            _ = await message.reply_text(
+                "Usage: <code>/pinned on</code> or <code>/pinned off</code>",
+                parse_mode="HTML",
+            )
+            return
+        new_value = chosen == "on"
+        state.set_todowrite_pinned_enabled(new_value)
+        logger.info("cmd_pinned: %r → %r", enabled, new_value)
+        _ = await message.reply_text(
+            f"📌 Pinned TodoWrite cards: <b>{'on' if new_value else 'off'}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                ("✓ on" if enabled else "  on"), callback_data="pinned:on"
+            ),
+            InlineKeyboardButton(
+                ("✓ off" if not enabled else "  off"), callback_data="pinned:off"
+            ),
+        ]
+    ]
+    _ = await message.reply_text(
+        f"📌 <b>TodoWrite pinned cards</b> · current: "
+        f"<b>{'on' if enabled else 'off'}</b>\n\n"
+        "When <i>on</i>, the bot pins Claude's TodoWrite list per pane "
+        "and edits it in place as the agent updates. When <i>off</i>, "
+        "no pins created and no existing pins touched.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 async def cmd_which(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not _authorised(message.chat_id):
@@ -1794,6 +1848,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
+    if data.startswith("pinned:"):
+        chosen = data[len("pinned:"):]
+        if chosen not in ("on", "off"):
+            _ = await query.answer("Bad arg", show_alert=True)
+            return
+        new_value = chosen == "on"
+        state.set_todowrite_pinned_enabled(new_value)
+        logger.info("pinned: callback set enabled=%r", new_value)
+        _ = await query.answer(f"📌 → {chosen}")
+        try:
+            _ = await query.edit_message_text(
+                f"📌 Pinned TodoWrite cards: <b>{'on' if new_value else 'off'}</b>",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception:
+            # Telegram occasionally rejects edits on messages whose
+            # HTML has become malformed by prior edits, or when the
+            # message was deleted between dispatch and edit. State
+            # persisted + toast already fired, so swallow.
+            pass
+        return
+
     if data.startswith("ans:"):
         _, pane_id, answer = data.split(":", 2)
         if not _pane_exists(pane_id):
@@ -2793,6 +2870,7 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("panes", "List Claude Code panes (tap to activate+subscribe)", cmd_panes),
     ("use", "Set active pane: /use %N", cmd_use),
     ("mode", "Set permission mode for new panes: /mode [name]", cmd_mode),
+    ("pinned", "Toggle TodoWrite pinned card: /pinned [on|off]", cmd_pinned),
     ("which", "Show the active pane", cmd_which),
     ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
     ("new", "Spawn a new Claude pane: /new [dir]", cmd_new),
