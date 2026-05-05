@@ -11,3 +11,7 @@ wheels/
 
 # Nix
 result
+
+# Claude Code — personal/agent files not for the repo
+CLAUDE.local.md
+AGENTS.md

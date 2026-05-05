@@ -599,6 +599,10 @@ From Telegram:
 - **Shell aliases only apply to interactive shells** — scripts that call `claude` non-interactively bypass the alias and run silently. That's usually what you want.
 - **Progress/dedup state lives in `~/.cache/tele-claude/`** — delete that directory to reset everything.
 
+## Development
+
+See [CLAUDE.md](./CLAUDE.md) for the project development guide — module layout, semver bump rules driven by `[fix]` / `[feat]` / `[refactor]` commit prefixes, the release checklist (`pyproject.toml` + `CHANGELOG.md` + tag), build/test commands, and notes on the wheel-packaging quirks.
+
 ## Security notes
 
 - Only chats listed in `CLAUDE_TELEGRAM_CHAT_ID` (comma-separated) are processed; everyone else is ignored silently
