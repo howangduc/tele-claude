@@ -6,6 +6,7 @@ Commands (single source of truth is ``_COMMANDS`` near the bottom):
   /which             — show the active pane.
   /pwd [%N]          — show pane's live working directory.
   /new [dir]         — spawn a fresh detached tmux session running claude; bare invocation prompts via ForceReply.
+  /resume [dir]      — pick a previous Claude session (~/.claude/projects/) and spawn a pane running claude --resume <id>.
   /get <path>        — upload a server-side file to Telegram as a document; bare invocation prompts via ForceReply.
   /cancel [%N]       — send Ctrl-C to a pane (active if omitted).
   /mute %N           — silence Notification + Stop hooks for that pane.
@@ -25,6 +26,7 @@ Callback handlers (from inline keyboards placed by hooks or by /panes):
   mfin:%N:1|2     — final step of multi-select: 1=Submit answers, 2=Cancel (digit + Enter on the TUI's review prompt).
   qr:%N:<text>    — quick-reply text to a pane.
   cancel:%N       — send Ctrl-C to a pane.
+  resume:<id>     — spawn a new pane running `claude --resume <id>` (from /resume picker).
   voice:send|cancel|retry|swap — speech-to-text confirm card actions
     (key derived from the bot reply's chat+message id; transcript +
     target pane + audio path are loaded from the pending-voice cache).
@@ -109,6 +111,7 @@ _BUILTIN_COMMANDS = {
     "which",
     "pwd",
     "new",
+    "resume",
     "get",
     "cancel",
     "mute",
@@ -724,8 +727,10 @@ async def _spawn_new_pane(
     message: Message,
     cwd_arg: str,
     context: ContextTypes.DEFAULT_TYPE | None = None,
+    launch_cmd: str | None = None,
+    initial_topic_title: str = "🚀 starting",
 ) -> None:
-    """Spawn a fresh detached tmux session running ``constants.LAUNCH_CMD`` and subscribe it.
+    """Spawn a fresh detached tmux session running a Claude launch command and subscribe it.
 
     Each ``/new`` gets its own session (not just a window) so concurrent
     Claude tasks stay isolated — independent scrollback, single
@@ -739,11 +744,18 @@ async def _spawn_new_pane(
     so the user lands directly in the chat thread for the new pane
     (issue #11). Without ``context`` the legacy single-thread reply
     path is used.
+
+    ``launch_cmd`` defaults to ``constants.LAUNCH_CMD``. ``/resume``
+    overrides it with ``"<base> --resume <session-id>"`` so the same
+    spawn machinery powers both fresh and resumed sessions.
     """
-    logger.info("cmd_new: spawning new session, cwd_arg=%r", cwd_arg)
+    effective_launch_cmd = launch_cmd or constants.LAUNCH_CMD
+    logger.info(
+        "spawn_new_pane: cwd_arg=%r launch_cmd=%r", cwd_arg, effective_launch_cmd
+    )
     cwd = os.path.expanduser(cwd_arg) if cwd_arg else os.path.expanduser("~")
     if not os.path.isdir(cwd):
-        logger.info("cmd_new: directory not found: %s", cwd)
+        logger.info("spawn_new_pane: directory not found: %s", cwd)
         _ = await message.reply_text(
             f"Directory not found: <code>{_html.escape(cwd)}</code>",
             parse_mode="HTML",
@@ -751,7 +763,7 @@ async def _spawn_new_pane(
         return
 
     session_name = _pick_session_name(cwd)
-    logger.info("cmd_new: creating session=%r cwd=%s", session_name, cwd)
+    logger.info("spawn_new_pane: creating session=%r cwd=%s", session_name, cwd)
     try:
         created = subprocess.run(
             [
@@ -771,19 +783,19 @@ async def _spawn_new_pane(
             check=True,
         )
     except subprocess.CalledProcessError as e:
-        logger.exception("cmd_new: tmux new-session failed")
+        logger.exception("spawn_new_pane: tmux new-session failed")
         _ = await message.reply_text(f"Failed to create session: {e.stderr or e}")
         return
     new_pane = created.stdout.strip()
     if not new_pane:
-        logger.error("cmd_new: tmux returned empty pane id")
+        logger.error("spawn_new_pane: tmux returned empty pane id")
         _ = await message.reply_text("tmux didn't return a pane id.")
         return
     logger.info(
-        "cmd_new: created pane %s in session %s, launching %r",
+        "spawn_new_pane: created pane %s in session %s, launching %r",
         new_pane,
         session_name,
-        constants.LAUNCH_CMD,
+        effective_launch_cmd,
     )
 
     time.sleep(constants.SPAWN_SETTLE_DELAY)
@@ -791,7 +803,7 @@ async def _spawn_new_pane(
     # verbatim instead of being parsed as tmux key names. Enter is
     # sent as a separate key sequence (no ``-l``) to actually submit.
     _ = subprocess.run(
-        ["tmux", "send-keys", "-t", new_pane, "-l", constants.LAUNCH_CMD],
+        ["tmux", "send-keys", "-t", new_pane, "-l", effective_launch_cmd],
         check=True,
     )
     _ = subprocess.run(
@@ -813,7 +825,7 @@ async def _spawn_new_pane(
     thread_id: int | None = None
     if context is not None:
         thread_id = await _ensure_topic_for_pane(
-            context.application, new_pane, pane_title="🚀 starting", cwd=cwd
+            context.application, new_pane, pane_title=initial_topic_title, cwd=cwd
         )
 
     short_cwd = cwd.replace(os.path.expanduser("~"), "~")
@@ -826,7 +838,7 @@ async def _spawn_new_pane(
         f"✅ Spawned <code>{_html.escape(new_pane)}</code> in "
         f"<code>{_html.escape(short_cwd)}</code>\n"
         f"New session <code>{_html.escape(session_name)}</code> (detached) · "
-        f"Launched <code>{_html.escape(constants.LAUNCH_CMD)}</code> · active + subscribed 🔔\n"
+        f"Launched <code>{_html.escape(effective_launch_cmd)}</code> · active + subscribed 🔔\n"
         f"Attach: <code>tmux attach -t {_html.escape(session_name)}</code>\n"
         f"{ready_line}"
     )
@@ -834,9 +846,7 @@ async def _spawn_new_pane(
     # topic on tap, so the user lands directly in the chat thread for
     # the pane they just spawned. Falls back to legacy single-thread
     # reply when forum mode is off / context not threaded through.
-    _ = await message.reply_text(
-        body, parse_mode="HTML", message_thread_id=thread_id
-    )
+    _ = await message.reply_text(body, parse_mode="HTML", message_thread_id=thread_id)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -870,6 +880,272 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             selective=True,
         ),
     )
+
+
+# ---------- /resume ----------
+
+# Cap on sessions shown by /resume. Telegram inline keyboards allow
+# more buttons but rendering 12 single-column rows already eats most of
+# a phone screen — past that, the user wants /resume <dir> to narrow.
+RESUME_LIST_MAX = 12
+
+# Width budget for the first-prompt preview on a /resume button. Each
+# button label is ``<basename> · <age> · <preview>``; total label cap
+# is ~60 chars per Telegram practical limit.
+RESUME_PREVIEW_MAX = 25
+
+# Strips XML-ish tags so Claude's <command-name>/<command-message>
+# wrappers (used for slash-command transcripts) collapse to readable
+# text — otherwise every /caveman session shows ``<command-message>...``
+# on its button.
+_RESUME_TAG_RE = re.compile(r"<[^>]+>")
+_RESUME_WS_RE = re.compile(r"\s+")
+
+
+def _decode_project_dir(encoded: str) -> str:
+    """Map ``-home-hainm-foo`` back to ``/home/hainm/foo``.
+
+    Best-effort decode for cases where the JSONL ``cwd`` field is
+    unavailable. Real cwds containing ``-`` are ambiguous (the encoding
+    is lossy) — for accurate paths we read ``cwd`` from the JSONL itself
+    in ``_list_recent_sessions``.
+    """
+    return "/" + encoded.lstrip("-").replace("-", "/")
+
+
+def _read_first_prompt(path: Path) -> tuple[str, str]:
+    """Return (cwd, first-user-prompt-preview) for a session JSONL.
+
+    Iterates the file once: grabs the first ``cwd`` field encountered
+    (any line type carries it) and the first ``user``-role message
+    whose content is plain text — i.e. an actual user-typed prompt,
+    not a tool-result echo. Falls back to empty preview if the file
+    is empty / corrupt / contains only tool_result entries.
+    """
+    cwd = ""
+    preview = ""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not cwd:
+                    candidate = entry.get("cwd")
+                    if isinstance(candidate, str) and candidate:
+                        cwd = candidate
+                if preview:
+                    if cwd:
+                        break
+                    continue
+                if entry.get("type") != "user":
+                    continue
+                msg = entry.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                text: str | None = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for chunk in content:
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("type") == "text":
+                            t = chunk.get("text")
+                            if isinstance(t, str):
+                                text = t
+                                break
+                if not text:
+                    continue
+                # Collapse XML tags + whitespace so /command-name and
+                # multi-line prompts render compactly on a button.
+                stripped = _RESUME_TAG_RE.sub(" ", text)
+                stripped = _RESUME_WS_RE.sub(" ", stripped).strip()
+                if stripped:
+                    preview = stripped
+    except OSError:
+        return cwd, preview
+    return cwd, preview
+
+
+def _format_age(seconds: float) -> str:
+    """Compact age string (``5m``, ``2h``, ``3d``, ``2w``)."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    if seconds < 86400 * 14:
+        return f"{int(seconds // 86400)}d"
+    return f"{int(seconds // (86400 * 7))}w"
+
+
+def _list_recent_sessions(
+    filter_dir: str | None = None, limit: int = RESUME_LIST_MAX
+) -> list[tuple[str, str, float, str]]:
+    """Walk ``~/.claude/projects`` and return recent session metadata.
+
+    Returns ``(session_id, cwd, age_seconds, first_prompt_preview)``
+    tuples sorted newest-first. Sessions whose ``cwd`` cannot be
+    determined fall back to the decoded project-dir name.
+
+    ``filter_dir`` (when set) restricts results to sessions whose
+    resolved ``cwd`` equals or sits inside the given directory —
+    matched against the absolute, ``~``-expanded form so users can
+    type ``~/foo``, ``./foo`` or ``/abs/path`` interchangeably.
+    """
+    projects_root = Path.home() / ".claude" / "projects"
+    if not projects_root.is_dir():
+        return []
+
+    target_abs: str | None = None
+    if filter_dir:
+        target_abs = os.path.realpath(os.path.expanduser(filter_dir))
+
+    candidates: list[tuple[float, Path, str]] = []
+    for project_dir in projects_root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for session_path in project_dir.glob("*.jsonl"):
+            try:
+                mtime = session_path.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, session_path, project_dir.name))
+
+    # Sort newest-first; cap the work to the recent slice plus a small
+    # buffer so a heavy filter still finds enough hits without parsing
+    # every session on disk.
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    scan_cap = limit * 6 if filter_dir else limit * 2
+    candidates = candidates[:scan_cap]
+
+    now = time.time()
+    out: list[tuple[str, str, float, str]] = []
+    for mtime, session_path, project_name in candidates:
+        cwd, preview = _read_first_prompt(session_path)
+        if not cwd:
+            cwd = _decode_project_dir(project_name)
+        if target_abs is not None:
+            cwd_abs = os.path.realpath(cwd)
+            if cwd_abs != target_abs and not cwd_abs.startswith(target_abs + os.sep):
+                continue
+        out.append((session_path.stem, cwd, max(0.0, now - mtime), preview))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _truncate_preview(text: str, width: int = RESUME_PREVIEW_MAX) -> str:
+    if len(text) <= width:
+        return text
+    return text[: max(1, width - 1)].rstrip() + "…"
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pick a previous Claude session and resume it in a fresh pane.
+
+    Usage:
+      /resume          → list up to 12 most-recent sessions across all
+                          ``~/.claude/projects/*/``.
+      /resume <dir>    → narrow to sessions whose recorded cwd sits
+                          under <dir> (handy when several repos share
+                          basenames).
+
+    Tap a session button → bot spawns a new tmux pane in that session's
+    cwd running ``<launch-cmd> --resume <session-id>`` and auto-subscribes
+    it (same flow as /new).
+    """
+    message = update.message
+    if not message or not _authorised(message.chat_id):
+        return
+    args = list(context.args or [])
+    filter_dir = args[0] if args else None
+    sessions = _list_recent_sessions(filter_dir=filter_dir)
+    if not sessions:
+        if filter_dir:
+            _ = await message.reply_text(
+                f"No Claude sessions found under <code>{_html.escape(filter_dir)}</code>.",
+                parse_mode="HTML",
+            )
+        else:
+            _ = await message.reply_text(
+                "No Claude sessions found in <code>~/.claude/projects/</code>.",
+                parse_mode="HTML",
+            )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for session_id, cwd, age, preview in sessions:
+        basename = os.path.basename(cwd.rstrip("/")) or "~"
+        preview_display = _truncate_preview(preview) if preview else "<no prompt>"
+        label = f"{basename} · {_format_age(age)} · {preview_display}"
+        # Telegram caps button labels around 64 chars; trim defensively.
+        rows.append(
+            [InlineKeyboardButton(label[:60], callback_data=f"resume:{session_id}")]
+        )
+
+    header_lines = ["Pick a session to resume (newest first):"]
+    if filter_dir:
+        header_lines.append(f"Filter: <code>{_html.escape(filter_dir)}</code>")
+    header_lines.append(f"Showing {len(sessions)} (cap {RESUME_LIST_MAX}).")
+    _ = await message.reply_text(
+        "\n".join(header_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def _find_session_path(session_id: str) -> Path | None:
+    """Locate the JSONL for a session_id (no enforced project layout).
+
+    Glob across ``~/.claude/projects/*/<id>.jsonl`` rather than trusting
+    a cached cwd — the session may have been opened from multiple
+    aliased paths and we want whichever one is on disk now.
+    """
+    projects_root = Path.home() / ".claude" / "projects"
+    if not projects_root.is_dir():
+        return None
+    matches = list(projects_root.glob(f"*/{session_id}.jsonl"))
+    return matches[0] if matches else None
+
+
+async def _spawn_resume_pane(
+    message: Message, session_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Resolve session cwd and spawn a pane running ``--resume <id>``.
+
+    Returns True on success so the caller can answer the callback with
+    the appropriate toast. Errors surface as user-visible reply text.
+    """
+    path = _find_session_path(session_id)
+    if path is None:
+        _ = await message.reply_text(
+            f"Session <code>{_html.escape(session_id)}</code> no longer on disk.",
+            parse_mode="HTML",
+        )
+        return False
+    cwd, _preview = _read_first_prompt(path)
+    if not cwd:
+        cwd = _decode_project_dir(path.parent.name)
+    # ``--resume <id>`` is appended literally — keeping the rest of
+    # LAUNCH_CMD (the ``TELE_CLAUDE=1`` opt-in + flags) intact so hooks
+    # still fire on the resumed pane.
+    launch_cmd = f"{constants.LAUNCH_CMD} --resume {session_id}"
+    short_id = session_id[:8]
+    await _spawn_new_pane(
+        message,
+        cwd,
+        context=context,
+        launch_cmd=launch_cmd,
+        initial_topic_title=f"↩ resume {short_id}",
+    )
+    return True
 
 
 async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1499,6 +1775,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _ = await query.answer(f"Failed: {e}", show_alert=True)
         return
 
+    if data.startswith("resume:"):
+        # /resume picker → spawn a new pane running ``claude --resume <id>``.
+        # Spawn work is slow (tmux + ready-poll), so answer the toast EARLY
+        # before kicking it off — Telegram greys the spinner around 15s.
+        # Buttons are dropped in place so the user can't double-tap into
+        # two parallel resume panes.
+        session_id = data[len("resume:") :]
+        if not session_id:
+            _ = await query.answer()
+            return
+        _ = await query.answer(f"↩ Resuming {session_id[:8]}…")
+        try:
+            _ = await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        try:
+            _ = await _spawn_resume_pane(message, session_id, context)
+        except Exception:
+            logger.exception("resume: spawn failed for %s", session_id)
+            try:
+                _ = await message.reply_text(
+                    f"Failed to resume <code>{_html.escape(session_id)}</code> — see logs.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return
+
     if data.startswith("voice:"):
         # Voice STT confirm/cancel/retry/swap. Pending state is keyed by
         # (chat_id, message_id) of the bot's reply (the card the buttons
@@ -1517,9 +1821,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if pending is None:
             _ = await query.answer("Expired")
             try:
-                _ = await query.edit_message_text(
-                    "⌛ expired", reply_markup=None
-                )
+                _ = await query.edit_message_text("⌛ expired", reply_markup=None)
             except Exception:
                 pass
             return
@@ -1527,9 +1829,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pane_id = str(pending.get("target_pane") or "")
         audio_path_str = str(pending.get("audio_path") or "")
         transcript_obj = pending.get("transcript")
-        provider = str(
-            pending.get("provider") or constants.STT_PROVIDER_DEFAULT
-        )
+        provider = str(pending.get("provider") or constants.STT_PROVIDER_DEFAULT)
 
         if action == "send":
             if not isinstance(transcript_obj, str) or not transcript_obj:
@@ -1565,9 +1865,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if action == "cancel":
             _ = await query.answer("Cancelled")
             try:
-                _ = await query.edit_message_text(
-                    "❌ Cancelled", reply_markup=None
-                )
+                _ = await query.edit_message_text("❌ Cancelled", reply_markup=None)
             except Exception:
                 pass
             state.clear_pending_voice(chat_id, msg_id)
@@ -1979,9 +2277,7 @@ async def on_voice(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     # filename includes both message_id (collision safety) and Telegram's
     # file_unique_id (idempotency on re-delivery).
     VOICE_DIR.mkdir(parents=True, exist_ok=True)
-    audio_path = (
-        VOICE_DIR / f"tg_{message.message_id}_{voice.file_unique_id}.ogg"
-    )
+    audio_path = VOICE_DIR / f"tg_{message.message_id}_{voice.file_unique_id}.ogg"
     tg_file = await voice.get_file()
     _ = await tg_file.download_to_drive(str(audio_path))
 
@@ -2130,9 +2426,7 @@ def _read_bang_bash_block(transcript: Path, cmd: str) -> str | None:
     return None
 
 
-async def _forward_bang_output(
-    message: Message, pane_id: str, raw_text: str
-) -> None:
+async def _forward_bang_output(message: Message, pane_id: str, raw_text: str) -> None:
     """Tail the pane's transcript for the matching bash entries Claude
     Code wrote, then reply with a 🐚 fenced code block.
 
@@ -2255,6 +2549,7 @@ _COMMANDS: list[tuple[str, str, _Handler]] = [
     ("which", "Show the active pane", cmd_which),
     ("pwd", "Show pane's working directory: /pwd [%N]", cmd_pwd),
     ("new", "Spawn a new Claude pane: /new [dir]", cmd_new),
+    ("resume", "Resume a previous Claude session: /resume [dir]", cmd_resume),
     ("get", "Upload a server file to Telegram: /get <path>", cmd_get),
     ("cancel", "Send Ctrl-C: /cancel [%N]", cmd_cancel),
     ("mute", "Silence hooks: /mute %N", cmd_mute),
