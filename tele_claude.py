@@ -1115,6 +1115,62 @@ def _find_session_path(session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _find_live_pane_for_session(session_id: str) -> str | None:
+    """Return a live Claude pane currently bound to ``session_id``, else None.
+
+    Two detection paths in priority order:
+
+    1. **Hook-recorded mapping.** Whenever a hook fires from a pane,
+       ``state.set_pane_transcript(pane_id, transcript_path)`` records
+       the JSONL Claude is writing. The session id is the file's stem,
+       so a reverse lookup is exact + cheap. Catches the common case
+       (any pane that's done at least one turn since the bot started).
+
+    2. **/proc/<pane_pid>/cmdline scan.** For panes that have never
+       fired a hook (fresh pane, no turn yet, or hooks-disabled), read
+       the foreground process's argv and look for ``--resume <id>``.
+       Linux-only; quietly skipped on macOS or if ``pane_pid`` is
+       unobtainable.
+
+    Without this guard, a user picking a session from ``/resume`` that
+    is already live in pane %N spawns a SECOND pane running the same
+    ``claude --resume <id>``. Two processes append to the same JSONL,
+    hooks race, and the user sees interleaved output (issue #23).
+    """
+    panes = _list_claude_panes()
+    for pane_id, _cmd, _title in panes:
+        recorded = state.get_pane_transcript(pane_id)
+        if recorded:
+            try:
+                if Path(recorded).stem == session_id:
+                    return pane_id
+            except (OSError, ValueError):
+                pass
+    # Fallback: process-args scan for panes with no hook history yet.
+    needle = f"--resume {session_id}"
+    for pane_id, _cmd, _title in panes:
+        try:
+            pid = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            continue
+        if not pid:
+            continue
+        try:
+            cmdline_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except (OSError, FileNotFoundError):
+            continue
+        # /proc/<pid>/cmdline is null-separated argv; flatten and substring-match.
+        cmdline = cmdline_raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        if needle in cmdline:
+            return pane_id
+    return None
+
+
 async def _spawn_resume_pane(
     message: Message, session_id: str, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
@@ -1130,6 +1186,28 @@ async def _spawn_resume_pane(
             parse_mode="HTML",
         )
         return False
+
+    # If this session is already live in another pane, re-bind the
+    # topic to that pane instead of spawning a duplicate. Two panes
+    # writing to the same JSONL produces interleaved output and dual
+    # hook fires — see issue #23.
+    existing_pane = _find_live_pane_for_session(session_id)
+    if existing_pane is not None:
+        state.set_active_pane(message.chat_id, existing_pane)
+        state.subscribe_pane(existing_pane)
+        thread_id = await _ensure_topic_for_pane(
+            context.application,
+            existing_pane,
+            pane_title=f"↩ resume {session_id[:8]}",
+        )
+        _ = await message.reply_text(
+            f"↩ Already live in <code>{_html.escape(existing_pane)}</code> — "
+            f"re-bound topic + active. Send messages here.",
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+        )
+        return True
+
     cwd, _preview = _read_first_prompt(path)
     if not cwd:
         cwd = _decode_project_dir(path.parent.name)
