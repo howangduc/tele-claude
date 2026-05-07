@@ -68,6 +68,20 @@ There is no test suite yet; the doctor command (`uv run tele-claude doctor`) is 
 - **Always** add new STT providers behind `SpeechToTextPort` in `tele_claude_speech.py`; selection is via `TELE_CLAUDE_STT_PROVIDER`.
 - **Always** preserve the subscription-gate behaviour: hooks must exit silently for unsubscribed panes (see `tele_claude_state.py`).
 
+## Issue authoring (caveman mode)
+
+GitHub issues filed against this repo (`SCP120/tele-claude` and the `kidclone3/tele-claude` fork — both `gh issue create` and any `gh issue edit` of issue bodies) MUST be written in **caveman mode** — the compressed style provided by the `caveman` plugin (project-scope, see `.claude/settings.json`).
+
+**Rules:**
+
+- **Always** invoke `/caveman` (or its rules) before drafting an issue title or body for this repo. If `/caveman` is unavailable, refuse to create the issue and tell the user the plugin is missing — do **not** fall back to verbose prose.
+- **Drop:** articles (a/the/an), filler phrases ("in order to", "it should be noted"), greetings, sign-offs, marketing voice.
+- **Keep:** technical terms exact, file paths, line numbers, code blocks, command examples — these MUST stay precise.
+- **Shape:** title stays in the existing `[bug] / [feat] / [fix]` prefix convention; body uses fragments, bullets over prose, `[thing] [action] [reason]. [next step].` pattern.
+- **Scope:** rule applies only to issues filed against the tele-claude repos. PR descriptions, commit messages, and CHANGELOG entries follow their own conventions (verbose prose is fine there).
+
+This is a deliberate forcing function — the maintainers prefer terse, scannable issues.
+
 <!-- Maintainer notes (stripped from Claude's context):
      - Keep this file under 200 lines. Path-scoped rules → .claude/rules/ if it grows.
      - Personal preferences belong in CLAUDE.local.md (gitignored).
