@@ -28,6 +28,7 @@ tele-claude-format = "tele_claude_format:main"
 dev = [
     "basedpyright>=1.38.3",
     "ruff>=0.15.7",
+    "pytest>=8.0",
 ]
 
 # Hatchling's auto-discovery for project name "tele-claude" picks exactly

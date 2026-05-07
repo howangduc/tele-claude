@@ -1308,6 +1308,33 @@ def _find_session_path(session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _pane_session_cwd(pane_id: str) -> str | None:
+    """Return the Claude session's recorded cwd for ``pane_id``, or None.
+
+    Reads the pane's tracked transcript JSONL (set by the hooks) and
+    returns the first ``cwd`` field. Used by ``/get`` to resolve
+    relative paths against the project Claude is actually working in,
+    not the TUI's launch directory which is what
+    ``#{pane_current_path}`` would report. (#36)
+    """
+    transcript_path = state.get_pane_transcript(pane_id)
+    if not transcript_path:
+        return None
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = entry.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
 def _find_live_pane_for_session(session_id: str) -> str | None:
     """Return a live Claude pane currently bound to ``session_id``, else None.
 
@@ -1473,12 +1500,21 @@ async def _send_file_to_user(message: Message, path_arg: str) -> None:
                 "Use an absolute path or set an active pane via /use."
             )
             return
-        probe = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_path}"],
-            capture_output=True,
-            text=True,
-        )
-        base = probe.stdout.strip()
+        # Prefer the Claude session's recorded cwd over the pane's
+        # foreground-process cwd. When the pane is running the Claude
+        # TUI, ``#{pane_current_path}`` returns the TUI's launch dir,
+        # not the project dir Claude is working in — so relative
+        # paths like ``tele-claude/report.md`` resolve against the
+        # parent of the project and 404. The session transcript
+        # JSONL records the true cwd Claude sees. (#36)
+        base = _pane_session_cwd(pane) or ""
+        if not base:
+            probe = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_path}"],
+                capture_output=True,
+                text=True,
+            )
+            base = probe.stdout.strip()
         if base:
             path = os.path.normpath(os.path.join(base, path))
     if not os.path.exists(path):
@@ -1751,10 +1787,16 @@ async def _send_next_question(
         return False
     next_q = questions[idx]
     if not isinstance(next_q, dict):
+        # Was a leak: malformed payload left dialog state alive
+        # for 15 min TTL and zombie-cursor'd the next AUQ. (#43)
+        state.clear_pending_questions(pane_id)
         return False
     body = tele_claude_questions.render_question_html(next_q, idx, total)
     rows_dict = tele_claude_questions.question_keyboard_rows(pane_id, next_q)
     if not rows_dict:
+        # Same leak shape as above — empty rows_dict (e.g. options=[])
+        # used to leave state alive. (#43)
+        state.clear_pending_questions(pane_id)
         return False
     try:
         _ = await context.bot.send_message(
@@ -1766,6 +1808,10 @@ async def _send_next_question(
         )
     except Exception:
         logger.exception("send_next_question: failed to send Q[%d]", idx)
+        # Network/Telegram failure mid-dialog should also tear down
+        # state so the user isn't stuck behind a half-rendered dialog
+        # the next AUQ inherits. (#43)
+        state.clear_pending_questions(pane_id)
         return False
     return True
 
@@ -1871,7 +1917,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if data.startswith("ans:"):
-        _, pane_id, answer = data.split(":", 2)
+        # Defensive: stale / forged callbacks like ``ans:%5`` (no
+        # answer digit) used to raise ``ValueError`` on tuple unpack
+        # and leave the Telegram spinner stuck. Mirrors the guard
+        # pattern already used by ``mtg:`` and ``mfin:``. (#41)
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            _ = await query.answer()
+            return
+        _, pane_id, answer = parts
         if not _pane_exists(pane_id):
             _ = await query.answer(f"{pane_id} gone", show_alert=True)
             return
@@ -1932,6 +1986,42 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except ValueError:
             _ = await query.answer()
             return
+        # Defensive: forged ``mtg:%P:99:0`` callbacks used to draw 99
+        # toggle buttons because n_options below fell back to ``idx``
+        # without an upper bound. Validate idx ∈ [1, _MAX_OPTIONS]
+        # before any tmux write. (#44)
+        if idx < 1 or idx > tele_claude_questions._MAX_OPTIONS:
+            _ = await query.answer()
+            return
+        # If the tapped option is a free-text "Type something" slot,
+        # refuse the tap — sending the digit would jump the TUI to
+        # text-input mode but Telegram has no inline-text input route
+        # on inline keyboards.
+        #
+        # KNOWN LIMITATION: ``pending_questions`` state is only written
+        # by the hook for multi-question chains (len(questions) > 1, see
+        # tele_claude_hooks.py). A single multi-select question whose
+        # last option is "Type something" still wedges the pane —
+        # ``pending`` is None below and we fall through to send the
+        # digit. Long-term: extend state-write to chain length 1 +
+        # multi-select, OR move heuristic into the hook itself. (#46)
+        pending = state.get_pending_questions(pane_id)
+        if pending:
+            try:
+                cur = _coerce_int(pending.get("current_idx"))
+                qs = pending.get("questions") or []
+                if isinstance(qs, list) and 0 <= cur < len(qs):
+                    cur_q = qs[cur]
+                    opts = cur_q.get("options") if isinstance(cur_q, dict) else None
+                    if isinstance(opts, list) and 0 < idx <= len(opts):
+                        if tele_claude_questions.is_free_text_option(opts[idx - 1]):
+                            _ = await query.answer(
+                                "Free-text option — attach to pane to type your answer.",
+                                show_alert=True,
+                            )
+                            return
+            except (TypeError, ValueError):
+                pass
         # Claude's multi-select TUI says "Enter to select · Tab/Arrow keys
         # to navigate" at the bottom. The digit alone JUMPS THE CURSOR to
         # option N but doesn't toggle it — Enter does the toggle of the
@@ -1950,13 +2040,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         new_mask = mask ^ (1 << (idx - 1))
         # Pull the option count from the existing keyboard shape (total
         # rows minus the trailing Submit row) so we don't have to re-ship
-        # the option list in every callback_data.
+        # the option list in every callback_data. Cap at _MAX_OPTIONS
+        # regardless of source so a forged callback can't expand the
+        # keyboard. (#44)
         current = message.reply_markup
         n_options = 0
         if current and current.inline_keyboard:
             n_options = max(0, len(current.inline_keyboard) - 1)
         if n_options == 0:
-            n_options = idx  # defensive fallback
+            # Keyboard absent (race or strip). Use the tapped idx as a
+            # safe lower bound — it's already validated above, so worst
+            # case we draw fewer rows than the original keyboard, never
+            # more.
+            n_options = idx
+        n_options = min(n_options, tele_claude_questions._MAX_OPTIONS)
         new_rows: list[list[InlineKeyboardButton]] = []
         for i in range(1, n_options + 1):
             checked = "☑" if new_mask & (1 << (i - 1)) else "☐"
@@ -2007,7 +2104,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 _ = await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
-            _ = await _send_next_question(context, message, pane_id)
+            sent = await _send_next_question(context, message, pane_id)
+            if not sent:
+                # _send_next_question's error paths self-clear pending
+                # state (#43). Surface that to the user so they aren't
+                # left looking at a blank topic wondering what happened
+                # — and so we don't fall through to the final review
+                # card emission below, which would mis-imply success. (#47)
+                _ = await query.answer(
+                    "⚠️ Next question failed — dialog reset.",
+                    show_alert=True,
+                )
+                return
             _ = await query.answer(f"Q {idx + 1}/{total} submitted")
             return
         # Last question (or no pending) — TUI is on review screen.
@@ -2070,7 +2178,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if data.startswith("qr:"):
-        _, pane_id, text = data.split(":", 2)
+        # Same guard shape as ``ans:`` — see #41.
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            _ = await query.answer()
+            return
+        _, pane_id, text = parts
         if not _pane_exists(pane_id):
             _ = await query.answer(f"{pane_id} gone", show_alert=True)
             return

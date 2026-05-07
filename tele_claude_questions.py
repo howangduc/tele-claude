@@ -48,6 +48,14 @@ def render_question_html(question: dict[str, Any], idx: int, total: int) -> str:
     )
     lines: list[str] = [header]
 
+    # Telegram cannot observe Claude TUI's pre-checked defaults — the
+    # mask in our callback_data starts at 0 even when the TUI has
+    # option N pre-selected. User is told to verify in pane. (#45)
+    if is_multi:
+        lines.append(
+            "<i>⚠️ Telegram cannot show TUI defaults — verify selection in pane.</i>"
+        )
+
     if isinstance(options, list):
         for i, opt in enumerate(options, start=1):
             if isinstance(opt, dict):
@@ -122,3 +130,34 @@ def question_keyboard_rows(
             ]
         )
     return rows
+
+
+# Free-text option labels Claude TUI uses for "let the user type a
+# custom answer." Detected case-insensitively; whitespace stripped.
+# Telegram has no inline-text-input on inline keyboards, so taps on
+# these are surfaced to the user as a "attach to pane" toast rather
+# than silently wedging the TUI. (#46)
+_FREE_TEXT_LABELS = frozenset(
+    {"type something", "other", "something else", "custom"}
+)
+
+
+def is_free_text_option(option: object) -> bool:
+    """Return True if ``option`` looks like a free-text "type your
+    own" slot rather than a pre-defined choice.
+
+    Heuristic match on the label text (case-insensitive, stripped).
+    Used by the bot's ``mtg:`` handler to refuse taps that would
+    wedge the TUI in text-input mode with no Telegram input route.
+
+    Heuristic chosen over substring/regex matching deliberately:
+    false positives (e.g. a real "Other" answer choice) forever-block
+    a legitimate option, while false negatives (a less-common label
+    like "Type another value") only revert to pre-fix behaviour.
+    """
+    label = ""
+    if isinstance(option, dict):
+        label = str(option.get("label") or "")
+    elif isinstance(option, str):
+        label = option
+    return label.strip().lower() in _FREE_TEXT_LABELS

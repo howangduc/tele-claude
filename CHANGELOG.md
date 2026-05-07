@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- pytest harness scaffold (`tests/conftest.py`, `tests/test_questions_rendering.py`) for the pure rendering helpers in `tele_claude_questions.py`. Project's first test suite (CLAUDE.md previously called doctor the smoke test).
+
+### Fixed
+
+- AskUserQuestion `ans:` and `qr:` callbacks no longer crash on malformed `callback_data` (e.g. stale `ans:%5` with no answer digit). Adopts the length-guard pattern already used by `mtg:` and `mfin:`. (#41)
+- AskUserQuestion with empty `options[]` no longer falls through to the generic Allow once / Always / Deny keyboard (which sent wrong-digit `ans:%P:1/2/3` callbacks). The hook now returns an empty inline keyboard for malformed AUQs; the body text still surfaces. (#42)
+- `_send_next_question` now clears `pending_questions` state on every error path. Three paths (non-dict next question, empty rows_dict, send_message exception) used to leak state until the 15-min TTL and zombie-cursor the next AUQ on the same pane. (#43)
+- Multi-select `mtg:` handler validates `idx ∈ [1, _MAX_OPTIONS]` and caps `n_options` at `_MAX_OPTIONS=8` regardless of source. Forged `mtg:%P:99:0` callbacks no longer expand the keyboard or send arbitrary digits to tmux. (#44)
+- Multi-select question bodies carry a one-line warning that Telegram cannot mirror Claude TUI's pre-checked defaults — short-term cosmetic until capture-pane parsing of `[✓]` markers lands. (#45)
+- Multi-select free-text option taps ("Type something" / "Other" / "Custom" / "Something else") refuse with an alert toast instead of wedging the TUI in text-input mode with no Telegram input route. **Known limit:** the refusal only fires for multi-question chains (`len(questions) > 1`); a SINGLE multi-select question with a free-text option still wedges. Tracked under the long-term ForceReply migration. (#46)
+- `msub:` handler surfaces mid-chain `_send_next_question` failures with an alert toast ("Next question failed — dialog reset.") instead of silently falling through to the final-review keyboard. Aligns user visibility with bot state after #43's state-clear. (#47)
+- `/get <relative-path>` now resolves against the Claude session's recorded cwd when the pane has a tracked Claude session, fixing paths that previously resolved against the TUI's launch directory and 404'd. Falls back to `pane_current_path` for panes without a tracked session. (#36)
+
 ## [0.3.1] — 2026-05-05
 
 ### Changed

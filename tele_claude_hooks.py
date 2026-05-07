@@ -915,6 +915,11 @@ def _build_permission_keyboard(
             rows = tele_claude_questions.question_keyboard_rows(pane_id, first)
             if rows:
                 return {"inline_keyboard": rows}
+        # AUQ with no usable options must NOT fall through to the
+        # generic Allow/Always/Deny keyboard below — that surfaces
+        # wrong-digit ans:%P:1/2/3 callbacks for a malformed dialog.
+        # Surface no buttons; user attaches to tmux to answer. (#42)
+        return {"inline_keyboard": []}
 
     if tool and tool.get("name") == "ExitPlanMode":
         return {
