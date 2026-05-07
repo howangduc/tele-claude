@@ -639,7 +639,11 @@ def _is_button_safe_url(url: str) -> bool:
 def _url_buttons(text: str, max_buttons: int = 4) -> list[list[dict[str, Any]]]:
     seen: list[str] = []
     for url in _URL_RE.findall(text):
-        url = url.rstrip(".,;:!?)]")
+        # Strip markdown decoration adjacent to the URL (`**bold**`, `__under__`,
+        # `~~strike~~`) so a URL captured from raw markdown doesn't keep the
+        # closing tokens. Plain punctuation goes too — Telegram rejects URLs
+        # with trailing junk and the visual appearance was confusing.
+        url = url.rstrip(".,;:!?)]*_~")
         if not url or url in seen:
             continue
         if not _is_button_safe_url(url):
