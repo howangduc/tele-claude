@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-05-07
+
+### Fixed
+
+- AUQ multi-select free-text options now render with `✏️` marker on the inline keyboard so users see they can't toggle the slot before tapping (Phase 6 of PR #48 only refused taps reactively with a toast). Pencil marker survives sibling-toggle redraws by consulting `pending_questions`. (#46 UX follow-up)
+
 ## [0.3.3] — 2026-05-07
 
 ### Fixed

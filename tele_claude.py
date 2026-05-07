@@ -2054,13 +2054,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # more.
             n_options = idx
         n_options = min(n_options, tele_claude_questions._MAX_OPTIONS)
+        # Identify free-text option positions so the ✏️ marker
+        # painted by the initial render survives subsequent
+        # redraws. Falls back to empty when pending_questions
+        # absent (chain length 1 — known limit, see KNOWN
+        # LIMITATION block above).
+        free_text_positions: set[int] = set()
+        if pending:
+            try:
+                cur_idx = _coerce_int(pending.get("current_idx"))
+                qs = pending.get("questions") or []
+                if isinstance(qs, list) and 0 <= cur_idx < len(qs):
+                    cur_q = qs[cur_idx]
+                    cur_opts = (
+                        cur_q.get("options") if isinstance(cur_q, dict) else None
+                    )
+                    if isinstance(cur_opts, list):
+                        for j, opt in enumerate(cur_opts, start=1):
+                            if tele_claude_questions.is_free_text_option(opt):
+                                free_text_positions.add(j)
+            except (TypeError, ValueError):
+                pass
         new_rows: list[list[InlineKeyboardButton]] = []
         for i in range(1, n_options + 1):
-            checked = "☑" if new_mask & (1 << (i - 1)) else "☐"
+            if i in free_text_positions:
+                icon = "✏️"
+            else:
+                icon = "☑" if new_mask & (1 << (i - 1)) else "☐"
             new_rows.append(
                 [
                     InlineKeyboardButton(
-                        f"{checked} {i}",
+                        f"{icon} {i}",
                         callback_data=f"mtg:{pane_id}:{i}:{new_mask}",
                     )
                 ]

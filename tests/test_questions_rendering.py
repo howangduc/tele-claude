@@ -100,3 +100,25 @@ def test_is_free_text_option_label_match() -> None:
     assert q.is_free_text_option({"label": "Yes"}) is False
     assert q.is_free_text_option({}) is False
     assert q.is_free_text_option(None) is False
+
+
+def test_keyboard_rows_marks_free_text_with_pencil() -> None:
+    """Free-text options render with ✏️ marker on initial paint so
+    user sees they can't toggle this slot before tapping. (#46 UX)
+    """
+    rows = q.question_keyboard_rows(
+        "%5",
+        {
+            "multiSelect": True,
+            "options": [
+                {"label": "Yes"},
+                {"label": "No"},
+                {"label": "Type something"},
+            ],
+        },
+    )
+    # 3 toggle rows + 1 submit row
+    assert len(rows) == 4
+    assert rows[0][0]["text"].startswith("☐")  # Yes
+    assert rows[1][0]["text"].startswith("☐")  # No
+    assert rows[2][0]["text"].startswith("✏️")  # Type something

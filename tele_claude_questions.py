@@ -99,10 +99,15 @@ def question_keyboard_rows(
     if is_multi:
         rows: list[list[dict[str, Any]]] = []
         for i in range(1, n + 1):
+            # Free-text options ("Type something" / "Other" / ...) get
+            # ✏️ instead of ☐ so the user sees the slot is special
+            # before tapping. Tap is still refused by the bot's mtg:
+            # handler with an alert toast — see is_free_text_option.
+            icon = "✏️" if is_free_text_option(options[i - 1]) else "☐"
             rows.append(
                 [
                     {
-                        "text": f"☐ {i}",
+                        "text": f"{icon} {i}",
                         "callback_data": f"mtg:{pane_id}:{i}:0",
                     }
                 ]
