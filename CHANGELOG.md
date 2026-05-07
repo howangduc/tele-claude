@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-05-07
+
+### Fixed
+
+- `_url_buttons` strips trailing markdown decoration (`*`, `_`, `~`) from URL inline-button hrefs. Earlier `rstrip(".,;:!?)]")` left `**bold**`/`__under__`/`~~strike~~` trailers intact, producing 404'd or wrong-target links. (#39, PR #40)
+
 ## [0.3.2] — 2026-05-07
 
 ### Added
