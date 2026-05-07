@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-07
+
 ### Added
 
 - pytest harness scaffold (`tests/conftest.py`, `tests/test_questions_rendering.py`) for the pure rendering helpers in `tele_claude_questions.py`. Project's first test suite (CLAUDE.md previously called doctor the smoke test).
@@ -98,6 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Photo/document attachment forwarding.
 - `/new`, `/get`, `/cancel`, `/history`, `/shortcut` commands.
 
-[Unreleased]: https://github.com/SCP120/tele-claude/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/SCP120/tele-claude/compare/v0.3.2...HEAD
 [0.1.1]: https://github.com/SCP120/tele-claude/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/SCP120/tele-claude/releases/tag/v0.1.0
