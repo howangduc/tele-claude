@@ -225,6 +225,21 @@ def _pane_exists(pane_id: str) -> bool:
     return pane_id in result.stdout.split()
 
 
+def _alive_tmux_panes() -> set[str]:
+    """Return the set of pane IDs the tmux server currently knows about.
+
+    Empty set when no tmux server is running — which is the right answer
+    for the boot-prune path: no server means every previously-subscribed
+    pane is dead. (#54)
+    """
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.split())
+
+
 def _send_to_tmux(pane_id: str, text: str) -> None:
     # Multi-line text lands in Claude Code's TUI as a collapsed
     # `[Pasted text #N +M lines]` token. If we hit Enter too quickly
@@ -3129,6 +3144,21 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.COMMAND, on_slash_passthrough))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # Boot-prune (#54): validate every pane reference in state against
+    # the current tmux server. After reboot, sleep+wake, or
+    # `tmux kill-server`, old pane IDs are dead. The state file
+    # survives in ~/.cache/tele-claude/, so we'd otherwise show ghost
+    # subscriptions in /panes and route hook output to dead panes.
+    alive = _alive_tmux_panes()
+    removed_subs, removed_muted = state.prune_panes(alive)
+    if removed_subs or removed_muted:
+        logger.info(
+            "boot-prune: dropped %d subscribed and %d muted dead pane(s) "
+            "(alive=%d)",
+            len(removed_subs),
+            len(removed_muted),
+            len(alive),
+        )
     logger.info("Bot started, polling...")
     app.run_polling()
 

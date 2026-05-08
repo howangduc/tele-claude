@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-05-08
+
+### Fixed
+
+- Bot startup now prunes pane references in `state.json` against the live tmux pane set. After a reboot, sleep+wake, or `tmux kill-server`, ghost panes no longer linger in `/panes`, and a fresh pane that happens to reuse an old `%N` no longer inherits stale subscription state. Adds a `_alive_tmux_panes()` helper plus 3 unit tests on `state.prune_panes`. (#54)
+
 ## [0.3.5] — 2026-05-08
 
 ### Changed
