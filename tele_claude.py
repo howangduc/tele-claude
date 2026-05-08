@@ -1859,10 +1859,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     data = query.data or ""
 
+    # Convention (#53): callback acknowledgement uses
+    #   query.answer()                          for SUCCESS paths
+    #   query.answer(text, show_alert=True)     for ERROR / REFUSAL
+    # Telegram requires every callback get an answerCallbackQuery
+    # within 30s or the spinner sticks. Bare answer() is the silent
+    # form. Don't add show_alert=True for success acks — the
+    # buttons-removed (edit_message_reply_markup(None)) is sufficient
+    # visible feedback.
+
     if data.startswith("use:"):
         pane_id = data[4:]
         state.set_active_pane(message.chat_id, pane_id)
-        _ = await query.answer(f"Active: {pane_id}")
+        _ = await query.answer()
         _ = await query.edit_message_text(
             f"Active pane: {pane_id}\n\nSend any message to forward it here."
         )
@@ -1934,9 +1943,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
             return
-        # Alert-style popup (needs a tap to dismiss) so the user gets
-        # unambiguous confirmation even if they miss the brief toast.
-        _ = await query.answer(f"✅ Sent {answer} → {pane_id}", show_alert=True)
+        # Silent ack (#53). Visible feedback comes from the buttons
+        # being removed below; the modal alert was redundant.
+        _ = await query.answer()
         # Drop the buttons so the message visually "commits" to the
         # decision. We deliberately DON'T edit the body — the original
         # message's HTML (plan, question text, preamble) is kept intact
@@ -2098,7 +2107,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception:
             pass
-        _ = await query.answer(f"Toggled {idx}")
+        _ = await query.answer()
         return
 
     if data.startswith("msub:"):
@@ -2140,7 +2149,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     show_alert=True,
                 )
                 return
-            _ = await query.answer(f"Q {idx + 1}/{total} submitted")
+            _ = await query.answer()
             return
         # Last question (or no pending) — TUI is on review screen.
         # Swap THIS message's keyboard in place to the Submit/Cancel
@@ -2166,7 +2175,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception:
             pass
-        _ = await query.answer("Review — tap to finalise")
+        _ = await query.answer()
         return
 
     if data.startswith("mfin:"):
@@ -2197,8 +2206,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # manually navigated past the review screen in tmux), drop it
         # so the next AskUserQuestion call starts fresh.
         state.clear_pending_questions(pane_id)
-        label = "Submitted" if choice == "1" else "Cancelled"
-        _ = await query.answer(f"✅ {label} → {pane_id}", show_alert=True)
+        # Silent ack (#53). Buttons-removed above is the visible signal.
+        _ = await query.answer()
         return
 
     if data.startswith("qr:"):
@@ -2213,7 +2222,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         try:
             _send_to_tmux(pane_id, text)
-            _ = await query.answer(f"→ {pane_id}: {text}")
+            _ = await query.answer()
         except subprocess.CalledProcessError as e:
             _ = await query.answer(f"Failed: {e}", show_alert=True)
         return

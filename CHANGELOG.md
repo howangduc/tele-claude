@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-05-08
+
+### Changed
+
+- Permission / AUQ / multi-select / quick-reply / switch-pane button taps no longer fire a Telegram modal alert or transient toast. Bare `query.answer()` (silent ack) is now the convention for success-path callback handlers; the existing button-removal via `edit_message_reply_markup(None)` is the visible feedback. Error and refusal paths (pane-gone, subprocess Failed, free-text refusal, mid-chain failure, Ctrl-C cancel) keep their alert-style modals because they need explicit acknowledgement. (#53)
+
 ## [0.3.4] — 2026-05-07
 
 ### Fixed
