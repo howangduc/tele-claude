@@ -15,6 +15,13 @@ jobs:
       - run: uv run ruff check .
       - run: uv run basedpyright tele_claude.py tele_claude_hooks.py tele_claude_state.py tele_claude_format.py
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run pytest
+
   build:
     runs-on: ubuntu-latest
     steps:
