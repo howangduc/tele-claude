@@ -68,13 +68,13 @@ Run directly with `uvx` (no clone needed):
 
 ```bash
 . ~/.config/tele-claude/env
-uvx --from git+https://github.com/SCP120/tele-claude tele-claude
+uvx --from git+https://github.com/howangduc/tele-claude tele-claude
 ```
 
 Or clone and run locally:
 
 ```bash
-git clone https://github.com/SCP120/tele-claude.git
+git clone https://github.com/howangduc/tele-claude.git
 cd tele-claude
 . ~/.config/tele-claude/env
 uv run tele-claude

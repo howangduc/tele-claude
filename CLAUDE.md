@@ -70,7 +70,7 @@ There is no test suite yet; the doctor command (`uv run tele-claude doctor`) is 
 
 ## Issue authoring (caveman mode)
 
-GitHub issues filed against this repo (`SCP120/tele-claude` and the `kidclone3/tele-claude` fork — both `gh issue create` and any `gh issue edit` of issue bodies) MUST be written in **caveman mode** — the compressed style provided by the `caveman` plugin (project-scope, see `.claude/settings.json`).
+GitHub issues filed against this repo (`howangduc/tele-claude` — both `gh issue create` and any `gh issue edit` of issue bodies) MUST be written in **caveman mode** — the compressed style provided by the `caveman` plugin (project-scope, see `.claude/settings.json`).
 
 **Rules:**
 
