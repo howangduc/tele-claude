@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (cosmetic):** forum-mode topic names are now just the **project folder basename** (e.g. `tele-claude`) instead of `%N · <live tmux title> · <full cwd>` (e.g. `%9 · 💤 idle · /home/you/tele-claude`). Live activity icons stay visible in `/panes` and inside each topic's messages — the topic name no longer needs to carry them. Existing topics keep their old names until the pane fires its next rename (throttled by `TELE_CLAUDE_TOPIC_RENAME_EVERY`, default 15 turns).
+- Removed unused `TOPIC_CWD_MAX` constant and the `_truncate_middle` helper in both `tele_claude.py` and `tele_claude_hooks.py` (only callers were the old topic-name composer).
+
 ## [0.3.6] — 2026-05-08
 
 ### Fixed

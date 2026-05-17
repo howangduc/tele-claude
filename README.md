@@ -635,19 +635,17 @@ When the bot runs inside a Telegram **supergroup with Topics enabled**, each Cla
 
 ### Topic naming
 
-Each topic is named `%N · <live tmux title> · <full cwd>`:
+Each topic is named after the **project folder basename** of the pane's current working directory — short and scannable in the Telegram topic list:
 
-| Pane state | Example topic name |
-|------------|--------------------|
-| Working | `%15 · ⏳ 7t · Bash +2a · /home/you/Source/foo` |
-| Idle | `%9 · 💤 idle · /home/you/tele-claude` |
-| Permission pending | `%21 · 🔐 Edit · /home/you/genbook-mono` |
-| Just replied | `%21 · 🤖 Found 3 issues · /home/you/genbook-mono` |
+| Pane | cwd | Topic name |
+|------|-----|------------|
+| %9 | `/home/you/tele-claude` | `tele-claude` |
+| %15 | `/home/you/Source/foo` | `foo` |
+| %21 | `/home/you/genbook-mono/api` | `api` |
 
-The name **refreshes every N Claude turns** so the topic list mirrors live activity without hammering Telegram's `editForumTopic` rate limit. Throttling is two-gated:
+Live pane activity (`⏳ working`, `💤 idle`, `🔐 Edit`, `🤖 done`) and the `%N` id are still visible in the bot's `/panes` listing and inside each topic's messages, so the topic name doesn't need to carry that signal too. If a pane `cd`s into a different project, the topic renames itself on the next Claude turn (throttled by `TELE_CLAUDE_TOPIC_RENAME_EVERY`, default **15** turns); panes that stay in one folder essentially never rename, which keeps Telegram's `editForumTopic` quota free.
 
-- **Turn counter** — a per-pane counter increments on each Stop hook; rename fires when the counter hits `TELE_CLAUDE_TOPIC_RENAME_EVERY` (default **15**, min 1). Override by adding e.g. `export TELE_CLAUDE_TOPIC_RENAME_EVERY=10` to `~/.config/tele-claude/env`.
-- **Change detection** — skipped entirely when the composed name already matches the last-cached one (no-op API call avoided).
+Two panes in the same project folder share a topic name — disambiguate by opening them. Messages inside a topic always route to that topic's bound pane regardless of name collision.
 
 ### Lifecycle
 

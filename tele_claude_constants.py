@@ -98,10 +98,6 @@ MIN_RAW_SPLIT = 800
 # Telegram caps forum-topic names at 128 chars; we stay well under.
 TOPIC_NAME_MAX = 120
 
-# CWD segment width budget inside a topic name (rest goes to pane id
-# + title + separators).
-TOPIC_CWD_MAX = 60
-
 # Prefix on "waiting for args" prompt messages — used both to emit
 # the prompt and to detect replies to it.
 ARGS_PROMPT_PREFIX = "Args for /"

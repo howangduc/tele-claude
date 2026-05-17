@@ -388,33 +388,16 @@ def _forum_enabled() -> bool:
     return _FORUM_CHAT_ID is not None
 
 
-def _truncate_middle(text: str, max_len: int) -> str:
-    """Shrink ``text`` to ``max_len`` by dropping characters from the middle."""
-    if len(text) <= max_len:
-        return text
-    if max_len < 3:
-        return text[:max_len]
-    keep = max_len - 1  # room for the ellipsis
-    head = keep // 2
-    tail = keep - head
-    return f"{text[:head]}…{text[-tail:]}"
+def _compose_topic_name(pane_id: str, _pane_title: str, cwd: str) -> str:
+    """Topic name = project folder basename only.
 
-
-def _compose_topic_name(pane_id: str, pane_title: str, cwd: str) -> str:
-    """Build ``%N · <title> · <full cwd>`` capped to Telegram's 128-char
-    topic-name limit. Full cwd is preserved verbatim unless it would
-    overflow, in which case the middle is ellipsised.
+    Pane id and live tmux title are intentionally dropped so the topic
+    list stays scannable. Falls back to ``pane_id`` when ``cwd`` is
+    empty or just ``/``. Final length is still guarded against
+    Telegram's topic-name limit, but a single basename almost never
+    needs it.
     """
-    title_part = pane_title.strip()
-    if len(title_part) > 40:
-        title_part = title_part[:37] + "…"
-    cwd_part = _truncate_middle(cwd, constants.TOPIC_CWD_MAX)
-    segments = [pane_id]
-    if title_part:
-        segments.append(title_part)
-    if cwd_part:
-        segments.append(cwd_part)
-    name = " · ".join(segments)
+    name = os.path.basename(cwd.rstrip("/")) or pane_id
     if len(name) > constants.TOPIC_NAME_MAX:
         name = name[: constants.TOPIC_NAME_MAX - 1] + "…"
     return name

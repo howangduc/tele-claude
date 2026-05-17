@@ -106,31 +106,11 @@ def _hook_chat_ids() -> list[str]:
 
 
 _TOPIC_NAME_MAX = constants.TOPIC_NAME_MAX
-_TOPIC_CWD_MAX = constants.TOPIC_CWD_MAX
 
 
-def _truncate_middle(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    if max_len < 3:
-        return text[:max_len]
-    keep = max_len - 1
-    head = keep // 2
-    tail = keep - head
-    return f"{text[:head]}…{text[-tail:]}"
-
-
-def _compose_topic_name(pane_id: str, pane_title: str, cwd: str) -> str:
-    title_part = pane_title.strip()
-    if len(title_part) > 40:
-        title_part = title_part[:37] + "…"
-    cwd_part = _truncate_middle(cwd, _TOPIC_CWD_MAX)
-    segments = [pane_id]
-    if title_part:
-        segments.append(title_part)
-    if cwd_part:
-        segments.append(cwd_part)
-    name = " · ".join(segments)
+def _compose_topic_name(pane_id: str, _pane_title: str, cwd: str) -> str:
+    """Topic name = project folder basename only. See twin in tele_claude.py."""
+    name = os.path.basename(cwd.rstrip("/")) or pane_id
     if len(name) > _TOPIC_NAME_MAX:
         name = name[: _TOPIC_NAME_MAX - 1] + "…"
     return name
